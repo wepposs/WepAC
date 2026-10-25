@@ -543,10 +543,11 @@ checks:
     threshold: 10
     # Statistical ore find-rate. Legit branch mining: ~0.5-1.5 diamond-tier
     # ores per 1000 stone. Xray walks straight to ores: 10-100x that.
-    # Very conservative by design - long window, high minimums, alerts first.
-    min-stone: 500
-    min-valuables: 15
-    max-ratio-per-1000: 8.0
+    # Conservative by design: 30-min window, high minimums, alerts first.
+    window-ms: 1800000
+    min-stone: 800
+    min-valuables: 20
+    max-ratio-per-1000: 12.0
   groundspoof:
     enabled: true
     threshold: 12

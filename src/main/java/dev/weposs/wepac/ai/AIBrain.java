@@ -49,11 +49,11 @@ public final class AIBrain {
     private long normCount = 0;
 
     private final ArrayDeque<TrainingSample> buffer = new ArrayDeque<>();
-    private long samplesPositive = 0;
-    private long samplesNegative = 0;
-    private long trainRounds = 0;
-    private double lastAvgError = -1;
-    private long lastSave = 0;
+    private volatile long samplesPositive = 0;
+    private volatile long samplesNegative = 0;
+    private volatile long trainRounds = 0;
+    private volatile double lastAvgError = -1;
+    private volatile long lastSave = 0;
 
     public AIBrain(WepAC plugin) {
         this.plugin = plugin;
@@ -238,9 +238,10 @@ public final class AIBrain {
                     else samplesNegative--;
                 }
             }
+            // increment under the same lock so counts never drift from the buffer
+            if (label > 0.5) samplesPositive++;
+            else samplesNegative++;
         }
-        if (label > 0.5) samplesPositive++;
-        else samplesNegative++;
         plugin.debug("AI sample (" + source + ") label=" + label);
     }
 
@@ -329,7 +330,7 @@ public final class AIBrain {
         return new File(plugin.getDataFolder(), plugin.config().aiModelFile);
     }
 
-    public void save() {
+    public synchronized void save() {
         File file = modelFile();
         try {
             File parent = file.getParentFile();

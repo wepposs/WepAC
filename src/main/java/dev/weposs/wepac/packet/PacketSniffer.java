@@ -89,6 +89,8 @@ public final class PacketSniffer {
                         }
                     });
             channels.put(player.getUniqueId(), channel);
+            // a successful injection re-arms warnings for any future failure
+            warned = false;
         } catch (Throwable t) {
             // a single player's failure must not disable packet checks for everyone;
             // log once and keep trying for other players / future joins

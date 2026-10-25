@@ -31,11 +31,10 @@ public final class FastBowCheck extends Check {
         if (player.getInventory().getItemInMainHand().getType() != Material.BOW) return;
 
         PlayerData data = plugin.data().get(player);
-        long now = System.currentTimeMillis();
-        // only (re)start the draw timer if not already drawing recently
-        if (data.bowDrawTime == 0L || now - data.bowDrawTime > 3000L) {
-            data.bowDrawTime = now;
-        }
+        // each right-click with a bow is a fresh draw; record its start time.
+        // (The old 3s guard ignored re-draws, so a second quick shot measured
+        // charge from the FIRST draw and escaped detection.)
+        data.bowDrawTime = System.currentTimeMillis();
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)

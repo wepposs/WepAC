@@ -129,6 +129,10 @@ public final class ConnectionListener implements Listener {
         // mining statistics are per-world; don't carry luck/ore-rates across worlds
         data.minedStone = 0;
         data.minedValuable = 0;
+        data.xrayWindowStart = 0L;
+        // position history is world-specific: stale coords from the old world
+        // would corrupt lag-compensated Reach right after the switch
+        data.posHistory.clear();
         // movement state is invalid across a world switch
         data.lastLocation = event.getPlayer().getLocation().clone();
         data.lastGroundLocation = null;

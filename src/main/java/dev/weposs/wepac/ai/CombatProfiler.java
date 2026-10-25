@@ -44,6 +44,7 @@ public final class CombatProfiler implements Listener {
         long lastHitTime;
         long lastCapture;
         int hits;
+        int hitsDealt; // hits THIS player landed (a passive victim must not donate)
         double[] snapshot; // raw features captured during active combat
     }
 
@@ -64,11 +65,11 @@ public final class CombatProfiler implements Listener {
         if (!(event.getEntity() instanceof Player victim)) return;
         if (!(event.getDamager() instanceof Player attacker)) return;
         if (victim.equals(attacker)) return;
-        touch(attacker);
-        touch(victim);
+        touch(attacker, true);
+        touch(victim, false);
     }
 
-    private void touch(Player player) {
+    private void touch(Player player, boolean dealt) {
         if (player.hasPermission("wepac.bypass")) return;
         long now = System.currentTimeMillis();
         Session s = sessions.get(player.getUniqueId());
@@ -79,6 +80,7 @@ public final class CombatProfiler implements Listener {
         }
         s.lastHitTime = now;
         s.hits++;
+        if (dealt) s.hitsDealt++;
         // snapshot telemetry while the fight is actually happening
         if (s.snapshot == null || now - s.lastCapture >= 2500L) {
             s.lastCapture = now;
@@ -115,6 +117,9 @@ public final class CombatProfiler implements Listener {
         long durationMs = s.lastHitTime - s.startTime;
         if (durationMs < 1000L * cfg.pvpMinSessionSeconds) return;
         if (s.hits < cfg.pvpMinHits) return;
+        // a player who only RECEIVED hits (standing still, getting farmed) has
+        // unrepresentative telemetry - only learn from those who actually fought
+        if (s.hitsDealt < Math.max(5, cfg.pvpMinHits / 4)) return;
 
         Player player = Bukkit.getPlayer(id);
         PlayerData data = plugin.data().getIfLoaded(id);

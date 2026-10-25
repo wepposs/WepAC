@@ -49,8 +49,11 @@ public final class BoatFlyCheck extends Check {
         if (!enabled()) return;
         Entity vehicle = event.getVehicle();
         if (!(vehicle instanceof Boat)) return;
-        if (vehicle.isEmpty()) return;
-        if (!(vehicle.getPassengers().get(0) instanceof Player player)) return;
+        // snapshot the passenger list once: a passenger could exit between the
+        // isEmpty() check and get(0), which would throw IndexOutOfBoundsException
+        java.util.List<Entity> passengers = vehicle.getPassengers();
+        if (passengers.isEmpty()) return;
+        if (!(passengers.get(0) instanceof Player player)) return;
         if (player.hasPermission("wepac.bypass")) return;
 
         PlayerData data = plugin.data().get(player);

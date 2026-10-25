@@ -115,6 +115,7 @@ public final class PlayerData {
     public long minedStone = 0;
     public long minedValuable = 0;
     public long xrayFlagCount = 0;
+    public long xrayWindowStart = 0L;
 
     // ---- gui attacks ----
     public int guiAttackBuffer = 0;

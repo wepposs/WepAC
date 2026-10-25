@@ -156,6 +156,33 @@ public final class ACCommand implements CommandExecutor, TabCompleter {
         d.minedStone = 0;
         d.minedValuable = 0;
         d.xrayFlagCount = 0;
+        d.xrayWindowStart = 0L;
+        // clear accumulated combat/rotation history so nothing "ripens" after rehab
+        d.attackCharges.clear();
+        d.attackAirborne.clear();
+        d.hitAngles.clear();
+        d.hitAnglesPvp.clear();
+        d.pitchReversals.clear();
+        d.pitchDeltaSamples.clear();
+        d.yawDeltaSamples.clear();
+        d.clickTimes.clear();
+        d.attackTimes.clear();
+        d.firedStages.clear();
+        d.cooldownLockBuffer = 0;
+        d.critRhythmBuffer = 0;
+        d.auraPerfectBuffer = 0;
+        d.auraGcdBuffer = 0;
+        d.auraGcdYawBuffer = 0;
+        d.auraPacingBuffer = 0;
+        d.auraSwingBuffer = 0;
+        d.auraLockBuffer = 0;
+        d.auraMultiBuffer = 0;
+        d.auraAngleBuffer = 0;
+        d.auraRateBuffer = 0;
+        d.silentRotBuffer = 0;
+        d.antiKbBuffer = 0;
+        d.chestStealBuffer = 0;
+        d.invMoveBuffer = 0;
         sender.sendMessage(WepAC.color(plugin.config().prefix()
                 + "&aCleared all violations for &f" + target.getName()));
     }

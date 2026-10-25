@@ -51,6 +51,16 @@ public final class XrayCheck extends Check {
         Material type = event.getBlock().getType();
         PlayerData data = plugin.data().get(player);
 
+        // time-bounded window (default 30 min): ore luck must not accumulate
+        // across a whole session and fire on a single lucky vein later
+        long now = System.currentTimeMillis();
+        long windowMs = plugin.config().optLongOr(CheckType.XRAY, "window-ms", 1_800_000L);
+        if (data.xrayWindowStart == 0L || now - data.xrayWindowStart > windowMs) {
+            data.xrayWindowStart = now;
+            data.minedStone = 0;
+            data.minedValuable = 0;
+        }
+
         if (STONE.contains(type)) {
             data.minedStone++;
         } else if (VALUABLE.contains(type)) {
@@ -59,9 +69,9 @@ public final class XrayCheck extends Check {
             return;
         }
 
-        long minStone = plugin.config().optLongOr(CheckType.XRAY, "min-stone", 500L);
-        long minValuables = plugin.config().optLongOr(CheckType.XRAY, "min-valuables", 15L);
-        double maxRatio = plugin.config().optDouble(CheckType.XRAY, "max-ratio-per-1000", 8.0);
+        long minStone = plugin.config().optLongOr(CheckType.XRAY, "min-stone", 800L);
+        long minValuables = plugin.config().optLongOr(CheckType.XRAY, "min-valuables", 20L);
+        double maxRatio = plugin.config().optDouble(CheckType.XRAY, "max-ratio-per-1000", 12.0);
 
         if (data.minedStone < minStone || data.minedValuable < minValuables) return;
 
