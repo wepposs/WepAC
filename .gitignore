@@ -1,0 +1,26 @@
+# Build output
+target/
+build/
+out/
+
+# Bundled Maven distribution (not part of the project)
+apache-maven-3.9.9/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Local scratch files
+cp.txt
+tools/*.class
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local server runtime
+run/
+plugins/
+logs/

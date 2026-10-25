@@ -1,0 +1,552 @@
+# ============================================================
+#  WepAC - self-learning AI anti-cheat
+#  Docs: README.md
+# ============================================================
+
+prefix: "&8[&cWepAC&8]&r "
+
+# Staff alerts
+alerts:
+  # Message sent to staff with wepac.alerts when a check triggers
+  format: "{prefix}&7{player} &8| &c{check} &8| &7VL {vl} &8| &7ping {ping}ms &8| &7AI {ai} &8| &f{info}"
+  # Also broadcast to console
+  console: true
+
+# Violation (VL) decay: removes {amount} VL every {interval} seconds of clean play
+decay:
+  interval: 30
+  amount: 1
+
+# ------------------------------------------------------------
+#  FALSE-POSITIVE GUARDS (protect honest players)
+# ------------------------------------------------------------
+guards:
+  # Players with ping above the threshold need twice as many confirmations
+  # for movement checks (their telemetry is noisier)
+  lag-guard: true
+  lag-ping-threshold: 450
+  # Teleport confirmed cheaters back to their last legal ground position
+  # (Fly / WallClimb / AirJump / Phase). Honest players are never affected:
+  # rollback only happens after a check has confirmed via its buffer.
+  rollback: true
+
+# Punishments. Commands run when a check reaches the VL 'at' value.
+# Placeholders: %player% %check% %vl%
+# The FIRST matching stage for a check fires; set command to "" to only alert.
+punishments:
+  enabled: true
+  default-stages:
+    - at: 10
+      command: ""            # alert only
+    - at: 25
+      command: "kick %player% &c[WepAC] Unfair advantage detected (%check%)"
+    - at: 50
+      command: "tempban %player% 1d &c[WepAC] %check%"
+  # Per-check overrides. BoatFly is deterministic physics (a boat cannot hover),
+  # so it punishes instantly on the first confirmed flag (threshold 3 + severity 5
+  # per flag passes the confirm gate at once).
+  overrides:
+    BOATFLY:
+      - at: 3
+        command: "tempban %player% 1d &c[WepAC] BoatFly — лодка не умеет летать"
+
+# ------------------------------------------------------------
+#  KICK/BAN CONFIRMATION - the anti-cheat only kicks when CONVINCED.
+#  A kick/ban stage executes when ANY of these holds:
+#   - at least {min-distinct-checks} different checks have active VL,
+#   - the triggering check reached threshold * {single-check-vl-multiplier},
+#   - the AI probability is at least {ai-probability}.
+#  Otherwise the stage is DEFERRED and retried on every further VL.
+# ------------------------------------------------------------
+confirm:
+  enabled: true
+  min-distinct-checks: 2
+  single-check-vl-multiplier: 1.5
+  ai-probability: 0.97
+
+# ------------------------------------------------------------
+#  POLICE RECORD ("учёт")
+#  First confirmed kick  -> player goes ON RECORD (WATCH): stricter
+#    thresholds, join announcements, every flag shown to staff.
+#  Another strike while ON RECORD -> full behaviour review (dossier score).
+#    score >= review-ban-score -> WANTED + auto-ban + rage alert.
+#    below                     -> the anti-cheat complains VERY loudly.
+#  Dossier score = distinctChecks*20 + min(totalVL,100)*0.5 + AI*40 + strikes*15
+# ------------------------------------------------------------
+record:
+  enabled: true
+  file: records.yml
+  watch-threshold-multiplier: 0.6
+  wanted-threshold-multiplier: 0.4
+  review-ban-score: 100
+  ban-command: "tempban %player% 7d &c[WepAC] Рецидив после учёта (%check%, score %score%)"
+  # What the anti-cheat screams into the staff console when the verdict is clear.
+  rage-message: "&4&l%player%&c&l, ЧИТАК ЕБУЧИЙ СУКА БАНЬТЕ БЛЯТЬ БЫСТРЕЕ НАХУЙ"
+  rage-repeat: 3
+
+# ------------------------------------------------------------
+#  CLIENT DETECTION
+#  On join every client announces itself via the "minecraft:brand" payload.
+#   - brand matches cheat-brands      -> 100% certainty, BAN + rage alert
+#   - brand suspicious/unknown        -> NOT banned (could be a rare vanilla
+#                                        launcher), put ON RECORD and watched
+#   - brand matches known-brands      -> reported to staff ("plays from ...")
+# ------------------------------------------------------------
+client-detect:
+  enabled: true
+  notify-staff: true
+  ban-command: "ban %player% &c[WepAC] Читерский клиент: %client%"
+  # Definitive cheat clients (substring match on the lowercased brand)
+  cheat-brands:
+    # --- verified from client sources/JARs (fabric.mod.json ids, 10-agent sweep) ---
+    - catlean
+    - vesence
+    - recode
+    - essence
+    - arbuz
+    - cometa
+    - crystall
+    - euphoria
+    - evaware
+    - skycore
+    - wexside
+    - xrose
+    - zov
+    - velka
+    - obsidian
+    - punch
+    - phobia
+    - wild
+    - winlend
+    - wonderful
+    - copyright
+    - systemdlc
+    - aimware
+    - exploit
+    - britva
+    - celestial
+    - collapse
+    - sadnes
+    - brokke
+    - minced
+    - ryzen
+    - toshiba
+    - dimasik
+    - expa
+    - delux
+    - vzmax
+    - govno
+    # --- from the loader/launcher collection ---
+    - rockstar
+    - nursultan
+    - ghost
+    - onyx
+    - aether
+    - xeno
+    - delta
+    - expensive
+    - evolate
+    - everlast
+    - eternity
+    - energy
+    - nuclear
+    - nexis
+    - valhalla
+    - wildclient
+    - monoton
+    - catlavan
+    - meow
+    - pouch
+    - akrien
+    - sadnes
+    - polyak
+    - peak
+    - solar
+    - wave
+    - quickfree
+    - zamorozka
+    - restance
+    - mrunpack
+    - anlprotect
+    - lightloader
+    # --- well-known public cheat clients ---
+    - wurst
+    - impact
+    - meteor
+    - liquidbounce
+    - rusherhack
+    - pyro
+    - lambda
+    - gamesense
+    - novoline
+    - neverlose
+    - zenith
+    - tenacity
+    - eureka
+    - injector
+    - injected
+  # Suspicious but unproven -> watch only, never ban
+  watch-brands:
+    - salwyrr
+    - modded
+  # NOTE: intentionally NOT banned by substring: bare "light" (collides with
+  # "flight"), bare "quick"/"beta" (too generic). Add manually if you see them.
+  # Known legit clients: substring -> display name for staff messages
+  known-brands:
+    vanilla: Vanilla
+    fabric: Fabric
+    forge: Forge
+    quilt: Quilt
+    optifine: OptiFine
+    lunar: Lunar Client
+    badlion: Badlion Client
+    tlauncher: TLauncher
+    hmcl: HMCL
+    multimc: MultiMC
+    prism: Prism Launcher
+    gdlauncher: GDLauncher
+    curseforge: CurseForge
+  # Completely unknown brand -> watch (ban is NEVER issued without certainty)
+  watch-unknown: true
+
+# ------------------------------------------------------------
+#  PACKET LAYER (direct netty hook, no external dependencies)
+#  Enables Timer / Blink / GroundSpoof / Criticals / BadPackets -
+#  checks that are impossible on Bukkit events alone.
+# ------------------------------------------------------------
+packet-sniffer:
+  enabled: true
+  # vanilla sends exactly ~20 move packets per second; 21+ sustained = timer
+  # (catches even subtle 1.05-1.1x timers like CatLean's 1.088)
+  timer-max-rate: 21
+  # how long the rate must stay above max before a Timer flag
+  timer-sustain-ms: 2500
+  # no move packets for this long while online = Blink
+  blink-timeout-ms: 2000
+
+# ------------------------------------------------------------
+#  SELF-LEARNING AI
+# ------------------------------------------------------------
+ai:
+  enabled: true
+  # Neural network training
+  learning-rate: 0.02
+  batch-size: 32
+  # Seconds between online training rounds
+  train-interval: 60
+  # Seconds between AI scoring passes over online players
+  score-interval: 3
+  # Save model to disk every N minutes (and on shutdown)
+  save-interval-minutes: 5
+  model-file: ai/model.bin
+
+  # Auto-labeling of training data:
+  auto-label:
+    # Player punished (kick/ban) by a check -> cheater sample
+    from-punishments: true
+    # Player online {clean-play-minutes} minutes with 0 violations -> legit sample
+    from-clean-play: true
+    clean-play-minutes: 20
+    # How many legit samples one clean player may donate per session
+    max-clean-samples: 3
+
+  # AI probability above which staff get a dedicated AI alert
+  alert-threshold: 0.90
+  # AI adjusts per-player check sensitivity (thresholds shrink for suspicious players)
+  adaptive-thresholds: true
+  # multiplier = clamp(high - (high-low)*probability, low, high)
+  adaptive-min-multiplier: 0.65
+  adaptive-max-multiplier: 1.30
+  # EXPERIMENTAL: let AI alone trigger punishments at very high probability.
+  # Keep false until the model has trained on your server.
+  punish-by-ai: false
+  punish-probability: 0.995
+
+  # Learning from real PvP: watch honest players fight and teach the model.
+  # A PvP session (player hits player) donates a LEGIT-labelled telemetry
+  # snapshot when it ends, but only if the donor passes all gates:
+  #   - zero active violations, police record CLEAN,
+  #   - AI probability below max-ai-probability,
+  #   - session was a real fight (duration + hit count).
+  # If a donor is later punished, ALL their past donations are purged.
+  pvp-learning:
+    enabled: true
+    session-timeout-seconds: 10   # no PvP hits for this long -> session over
+    min-session-seconds: 15       # minimum fight duration to learn from
+    min-hits: 20                  # minimum exchanged hits
+    max-ai-probability: 0.35      # donors the AI already suspects are skipped
+    max-samples-per-hour: 3       # donation rate limit per player
+
+# ------------------------------------------------------------
+#  CHECKS
+#  threshold = VL needed before punishment stages apply
+# ------------------------------------------------------------
+checks:
+  fly:
+    enabled: true
+    threshold: 20
+    # Ticks airborne while NOT losing altitude (hovering/rising)
+    max-hover-ticks: 8
+    # Flag client "on ground" while no solid block below (ground spoof)
+    detect-ground-spoof: true
+    # Physics simulation: accumulated blocks of "extra height" vs gravity
+    # simulation before flagging (catches glide/slow-fall/gradual-climb fly)
+    physics-divergence: 0.75
+  speed:
+    enabled: true
+    threshold: 25
+    # Max allowed = vanilla_limit * multiplier (vanilla sprint-jump ~0.29 b/tick)
+    multiplier: 1.45
+    buffer: 8
+  jesus:
+    enabled: true
+    threshold: 15
+    # Ticks walking on water surface before flag
+    max-ticks: 12
+  nofall:
+    enabled: true
+    threshold: 12
+    # Minimum fall distance (blocks) to require fall damage
+    min-fall-distance: 4.0
+  fastclimb:
+    enabled: true
+    threshold: 15
+    multiplier: 1.6
+  wallclimb:
+    enabled: true
+    threshold: 12
+    # Minimum sustained upward speed (blocks/tick) while touching a wall
+    min-rise: 0.03
+    # Height climbed above the wall-contact point before flagging.
+    # A vanilla jump along a wall rises at most ~1.25 blocks.
+    min-climb-height: 1.3
+  airjump:
+    enabled: true
+    threshold: 12
+    # Sudden upward velocity spikes while airborne (double jump)
+    buffer: 2
+  phase:
+    enabled: true
+    threshold: 10
+    # Consecutive ticks fully inside solid occluding cubes before flagging
+    min-ticks: 30
+  reach:
+    enabled: true
+    threshold: 12
+    # Max eye-to-hitbox distance in blocks
+    max-reach: 3.05
+    # Add ping/1000 * compensation blocks (capped)
+    ping-compensation: 0.35
+    max-ping-compensation: 0.6
+  autoclicker:
+    enabled: true
+    threshold: 20
+    # 1.9+ reality: damage is gated by the attack cooldown, and legit
+    # butterfly/drag clickers reach 20+ CPS. The CPS cap only catches
+    # impossible spam; the real signal is robotic interval consistency.
+    max-cps: 25
+    # Robotic consistency: std deviation of click intervals below this (ms)
+    # over at least {min-samples} clicks -> flag
+    min-interval-stddev: 12.0
+    min-samples: 45
+  killaura:
+    enabled: true
+    threshold: 18
+    # A. Max attacks per rolling second
+    max-attacks-per-second: 14
+    # B. Max angle (degrees) between look direction and a PLAYER victim
+    max-rotation-angle: 75.0
+    # C. Snap-aim: whole rotation onto the victim within one packet burst
+    snap-aim: true
+    snap-new-angle: 10.0      # aim lands within this many degrees of the victim
+    snap-old-angle: 32.0      # previous rotation was this far off the victim
+    snap-window-ms: 200       # rotation finished at most this long before the hit
+    # D. Mouse GCD: real mice quantise pitch deltas to a sensitivity constant
+    gcd-rotations: true
+    gcd-min: 0.005
+    # E. Pacing: metronome-regular attack intervals
+    attack-pacing: true
+    pacing-min-stddev: 25.0
+    # F. NoSwing: melee damage without an arm swing
+    no-swing: true
+    swing-window-ms: 400
+    # G. Aim-lock: crosshair glued to the victim with near-zero variance
+    aim-lock: true
+    lock-max-stddev: 0.5
+    # H. Multi-target: many distinct victims in a short window, all on-view
+    multi-target: true
+    multi-max-targets: 4
+    multi-window-ms: 1500
+    multi-max-angle: 40.0
+    # I. PerfectHits: aim-gated auras (vesence "Shard" etc.) attack only when the
+    #    crosshair settled on the target, so nearly every PvP hit lands within
+    #    ~1-2 degrees. Humans time clicks, their hit-angle spread is much wider.
+    perfect-hits: true
+    perfect-window: 12        # PvP hits analysed
+    perfect-angle: 2.5        # degrees from crosshair counted as "perfect"
+    perfect-ratio: 0.8        # fraction of perfect hits required to flag
+    # J. CooldownLock (1.9+ meta): the aura fires the instant the weapon reaches
+    #    full charge - charge pinned at ~1.0 with near-zero variance across many
+    #    hits AND metronomic intervals. Humans swing early/late and miss rhythm.
+    cooldown-lock: true
+    lock-min-attacks: 15
+    lock-min-charge: 0.98
+    lock-max-charge-stddev: 0.012
+    lock-max-interval-stddev: 80
+    # D2. Yaw GCD: horizontal-only rotators evade the pitch-GCD test
+    gcd-yaw: true
+    # K. GUI attacks: attacking with a container open is impossible in vanilla
+    gui-attacks: true
+    # Isolated suspicious events farther apart than this do NOT accumulate into a
+    # flag (only sustained bursts confirm). Prevents slow noise from "ripening".
+    buffer-reset-gap-ms: 4000
+  fastbow:
+    enabled: true
+    threshold: 10
+    # Full bow charge takes ~1100ms in vanilla
+    min-charge-ms: 300
+    min-force: 0.75
+  fastbreak:
+    enabled: true
+    threshold: 15
+    # Minimum ms between block breaks for non-instant blocks
+    min-interval-ms: 90
+  fastplace:
+    enabled: true
+    threshold: 15
+    min-interval-ms: 70
+  scaffold:
+    enabled: true
+    threshold: 15
+    # Flag placing blocks below feet while looking forward (pitch below this)
+    max-pitch: 25.0
+    buffer: 4
+  fastregen:
+    enabled: true
+    threshold: 10
+    # Minimum ms between natural saturation regen events
+    min-interval-ms: 3000
+  fasteat:
+    enabled: true
+    threshold: 10
+    # Vanilla eating/drinking takes ~1600ms (dried kelp is excluded, it is 400ms)
+    min-consume-ms: 900
+  step:
+    enabled: true
+    threshold: 15
+    # Rising faster than the 0.6-block auto-step while grounded
+    max-rise: 0.7
+    buffer: 3
+  noslow:
+    enabled: true
+    threshold: 15
+    # Vanilla slows to ~20% speed while using items (~0.05 b/t)
+    max-speed: 0.12
+    buffer: 6
+  waterwalk:
+    enabled: true
+    threshold: 15
+    # Fast swim/water-speed hacks (+0.07 per Depth Strider level is allowed)
+    max-speed: 0.32
+    buffer: 6
+  elytrafly:
+    enabled: true
+    threshold: 12
+    # Climbing while gliding without fireworks/riptide for N samples (4Hz)
+    max-rise: 0.08
+    samples: 5
+    # Unboosted elytra terminal velocity is ~2.5-2.7 b/t
+    max-speed: 3.2
+  boatfly:
+    enabled: true
+    threshold: 3
+    # Speed caps per surface (blocks/tick). Rowing ~0.4, ice roads up to ~1.6.
+    ice-speed-cap: 1.8
+    water-speed-cap: 0.55
+    land-speed-cap: 0.35
+    # Consecutive VehicleMoveEvents before each signal flags
+    hover-events: 6
+    rise-events: 4
+    speed-events: 8
+  noweb:
+    enabled: true
+    threshold: 12
+    # Vanilla crawls at ~0.05 b/t inside cobweb / berry bushes
+    web-max-speed: 0.20
+    berry-max-speed: 0.25
+    buffer: 4
+  inventorymove:
+    enabled: true
+    threshold: 12
+    # Camera rotation while a GUI is open is impossible in vanilla
+    min-rotation: 2.0
+    buffer: 5
+  cheststealer:
+    enabled: true
+    threshold: 12
+    # Human shift-click spam tops out around 8-10 clicks/sec
+    max-clicks-per-second: 14
+    window-ms: 1200
+    buffer: 2
+  airstuck:
+    enabled: true
+    threshold: 10
+    # Frozen mid-air for this many ticks
+    max-ticks: 60
+  longjump:
+    enabled: true
+    threshold: 12
+    # Horizontal bursts mid-air beyond sprint-jump physics (~0.35 b/t)
+    max-air-speed: 0.55
+    buffer: 2
+  timer:
+    enabled: true
+    threshold: 8
+  blink:
+    enabled: true
+    threshold: 8
+  badpackets:
+    enabled: true
+    threshold: 5
+  criticals:
+    enabled: true
+    threshold: 12
+    buffer: 3
+    # Crit rhythm (1.9+): jumping before every attack is legit, but a bot does
+    # it perfectly - 95%+ of PvP hits airborne at a metronomic interval.
+    crit-rhythm: true
+    rhythm-min-attacks: 15
+    rhythm-air-ratio: 0.95
+    rhythm-max-interval-stddev: 60
+  velocity:
+    enabled: true
+    threshold: 12
+    # Anti-KB ("Velocity" modules, e.g. CatLean's flagship absorbing 85-90%):
+    # after a significant hit the player must travel at least this fraction
+    # of the expected knockback distance
+    absorb-ratio: 0.35
+    buffer: 2
+  silentrot:
+    enabled: true
+    threshold: 12
+    # Silent rotations: server-side pitch snaps down for an action, then back
+    # to the camera angle - large fast reversals no human tracking sustains.
+    # Thresholds are deliberately high: legit players DO flick up/down in fights,
+    # so we require several LARGE reversals in a short window before flagging.
+    min-swing-deg: 30.0     # magnitude of each side of a reversal
+    flip-window-ms: 500     # max time between the two sides of one reversal
+    window-ms: 5000         # rolling window to count reversals in
+    min-reversals: 5
+    buffer: 2
+  xray:
+    enabled: true
+    threshold: 10
+    # Statistical ore find-rate. Legit branch mining: ~0.5-1.5 diamond-tier
+    # ores per 1000 stone. Xray walks straight to ores: 10-100x that.
+    # Very conservative by design - long window, high minimums, alerts first.
+    min-stone: 500
+    min-valuables: 15
+    max-ratio-per-1000: 8.0
+  groundspoof:
+    enabled: true
+    threshold: 12

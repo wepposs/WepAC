@@ -1,0 +1,23 @@
+name: WepAC
+version: 1.0.0
+main: dev.weposs.wepac.WepAC
+api-version: '1.21'
+author: wepposs
+description: Self-learning AI anti-cheat for Minecraft servers
+
+commands:
+  wepac:
+    description: WepAC main command
+    usage: /<command> help
+    aliases: [ac, wac, anticheck]
+
+permissions:
+  wepac.admin:
+    description: Full access to WepAC commands
+    default: op
+  wepac.alerts:
+    description: Receive cheat alerts
+    default: op
+  wepac.bypass:
+    description: Bypass all checks (use for builders/special worlds)
+    default: false
