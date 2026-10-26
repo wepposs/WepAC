@@ -50,10 +50,13 @@ public final class ACCommand implements CommandExecutor, TabCompleter {
             case "info" -> info(sender, args);
             case "label" -> label(sender, args);
             case "resetvl" -> resetVl(sender, args);
+            case "rehabilitate" -> rehabilitate(sender, args);
             case "record" -> record(sender, args);
             case "ai" -> ai(sender, args);
             case "version" -> sender.sendMessage(WepAC.color(
-                    plugin.config().prefix() + "&7WepAC &f1.0.0 &7(self-learning AI anti-cheat)"));
+                    plugin.config().prefix() + "&7WepAC &f"
+                            + plugin.getDescription().getVersion()
+                            + " &7(self-learning AI anti-cheat)"));
             default -> help(sender);
         }
         return true;
@@ -67,6 +70,7 @@ public final class ACCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage(WepAC.color(" &8- &f/ac info <player> &8- violations + AI score"));
         sender.sendMessage(WepAC.color(" &8- &f/ac label <player> <cheater|legit> &8- train the AI"));
         sender.sendMessage(WepAC.color(" &8- &f/ac resetvl <player> &8- clear player's violations"));
+        sender.sendMessage(WepAC.color(" &8- &f/ac rehabilitate <player> &8- full FP undo (VL + AI samples + record)"));
         sender.sendMessage(WepAC.color(" &8- &f/ac record <player> [watch|wanted|clear] &8- police record"));
         sender.sendMessage(WepAC.color(" &8- &f/ac ai status|save|reset &8- AI management"));
         sender.sendMessage(WepAC.color(" &8- &f/ac version"));
@@ -90,7 +94,9 @@ public final class ACCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage(WepAC.color(" &8- &7ping: &f" + target.getPing()
                 + "ms&8, &7AI: &c" + String.format(Locale.ROOT, "%.1f%%", d.aiProbability * 100)
                 + "&8, &7total VL: &f" + d.totalVl()
-                + "&8, &7online: &f" + (System.currentTimeMillis() - d.joinTime) / 60000 + "m"));
+                + "&8, &7online: &f" + (System.currentTimeMillis() - d.joinTime) / 60000 + "m"
+                + (d.legacy18() ? " &8[&e1.8 protocol&8]" : "")
+                + (d.bedrock() ? " &8[&eBedrock&8]" : "")));
         if (d.violations.isEmpty()) {
             sender.sendMessage(WepAC.color(" &8- &ano violations"));
         } else {
@@ -153,6 +159,14 @@ public final class ACCommand implements CommandExecutor, TabCompleter {
         d.airJumpBuffer = 0;
         d.phaseTicks = 0;
         d.hoverTicks = 0;
+        d.packetFlyBuffer = 0;
+        d.physicsSim.divergence = 0;
+        d.auraVotes.clear();
+        // A20: a rehabilitation that leaves the FP-derived AI samples and the
+        // suspicion score in place is half a rehabilitation
+        plugin.ai().purgeCheaterSamplesFrom(target.getUniqueId());
+        d.aiProbability = 0.0;
+        d.aiProbEma = 0.0;
         d.minedStone = 0;
         d.minedValuable = 0;
         d.xrayFlagCount = 0;
@@ -183,8 +197,51 @@ public final class ACCommand implements CommandExecutor, TabCompleter {
         d.antiKbBuffer = 0;
         d.chestStealBuffer = 0;
         d.invMoveBuffer = 0;
+        d.critsBuffer = 0;
+        d.nukerBuffer = 0;
+        d.fastClimbBuffer = 0;
+        d.guiAttackBuffer = 0;
+        d.cpsBuffer = 0;
+        // telemetry history must go too, or detectors "ripen" on the old story
+        // right after the rehabilitation
+        d.rateAttackTimes.clear();
+        d.recentTargets.clear();
+        d.invClickTimes.clear();
+        d.actionPitchReversals.clear();
+        d.actionYawReversals.clear();
+        d.speedSamples.clear();
+        d.airborneSamples.clear();
+        d.risingSamples.clear();
+        d.reachSamples.clear();
+        d.rotationSamples.clear();
+        d.lastAttackAt = 0L;
+        // rehabilitation must also clear the persisted copy, or the VL comes
+        // back on the next rejoin
+        plugin.vlStore().clear(target.getUniqueId());
         sender.sendMessage(WepAC.color(plugin.config().prefix()
                 + "&aCleared all violations for &f" + target.getName()));
+    }
+
+    /**
+     * The official false-positive undo path (A20): everything resetVl does,
+     * PLUS the police record is cleared - no residual stricter thresholds,
+     * no join announcements, no dossier score from a mistake.
+     */
+    private void rehabilitate(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage(WepAC.color("&c/ac rehabilitate <player>"));
+            return;
+        }
+        Player target = Bukkit.getPlayerExact(args[1]);
+        if (target == null) {
+            sender.sendMessage(WepAC.color("&cPlayer not found."));
+            return;
+        }
+        resetVl(sender, args);
+        plugin.records().clear(target.getUniqueId());
+        plugin.alerts().broadcastRaw("&a" + target.getName()
+                + " &7реабилитирован stafом &f" + sender.getName()
+                + "&7: VL, ИИ-сэмплы и учёт сброшены.");
     }
 
     private void record(CommandSender sender, String[] args) {
@@ -259,12 +316,20 @@ public final class ACCommand implements CommandExecutor, TabCompleter {
                 }
             }
             case "save" -> {
-                plugin.ai().save();
-                sender.sendMessage(WepAC.color(p + "&aModel saved."));
+                // async: the model file write must never block the main thread
+                Bukkit.getScheduler().runTaskAsynchronously(plugin, plugin.ai()::save);
+                sender.sendMessage(WepAC.color(p + "&aModel save scheduled."));
             }
             case "reset" -> {
-                plugin.ai().resetModel();
-                sender.sendMessage(WepAC.color(p + "&cModel and training buffer wiped."));
+                // irreversible: weeks of online learning are gone without confirmation
+                if (args.length < 3 || !args[2].equalsIgnoreCase("confirm")) {
+                    sender.sendMessage(WepAC.color(p + "&cThis IRREVERSIBLY deletes the trained "
+                            + "model and the whole training buffer (weeks of learning)."));
+                    sender.sendMessage(WepAC.color(p + "&7Repeat with &f/ac ai reset confirm&7 to proceed."));
+                } else {
+                    plugin.ai().resetModel();
+                    sender.sendMessage(WepAC.color(p + "&cModel and training buffer wiped."));
+                }
             }
             default -> sender.sendMessage(WepAC.color("&c/ac ai status|save|reset"));
         }
@@ -275,12 +340,14 @@ public final class ACCommand implements CommandExecutor, TabCompleter {
         List<String> out = new ArrayList<>();
         if (!sender.hasPermission("wepac.admin")) return out;
         if (args.length == 1) {
-            for (String s : new String[]{"reload", "alerts", "info", "label", "resetvl", "record", "ai", "version"}) {
+            for (String s : new String[]{"reload", "alerts", "info", "label", "resetvl",
+                    "rehabilitate", "record", "ai", "version"}) {
                 if (s.startsWith(args[0].toLowerCase(Locale.ROOT))) out.add(s);
             }
         } else if (args.length == 2 && (args[0].equalsIgnoreCase("info")
                 || args[0].equalsIgnoreCase("label")
                 || args[0].equalsIgnoreCase("resetvl")
+                || args[0].equalsIgnoreCase("rehabilitate")
                 || args[0].equalsIgnoreCase("record"))) {
             for (Player p : Bukkit.getOnlinePlayers()) {
                 if (p.getName().toLowerCase(Locale.ROOT).startsWith(args[1].toLowerCase(Locale.ROOT))) {

@@ -63,7 +63,19 @@ public final class MovementMonitor implements Listener {
         Location last = data.lastLocation;
         data.lastLocation = now.clone();
 
-        boolean grounded = GroundUtil.isOnGround(player);
+        // Real-elapsed normalisation: under TPS drops this task runs later than
+        // every 5 ticks, and dividing the larger distance by a fixed 5 would
+        // inflate every speed (false flags on lag). Measure what actually elapsed.
+        long nowMs = System.currentTimeMillis();
+        double elapsedTicks = data.lastMonitorTime == 0L ? INTERVAL_TICKS
+                : (nowMs - data.lastMonitorTime) / 50.0;
+        data.lastMonitorTime = nowMs;
+        elapsedTicks = Math.max(1.0, Math.min(40.0, elapsedTicks));
+
+        // per-tick ground truth from the 20Hz cache (fresh <= 200ms), direct
+        // block/entity scan only as a startup fallback
+        boolean grounded = nowMs - data.groundTruthAt <= 200L
+                ? data.groundTruth : GroundUtil.isOnGround(player);
         data.serverOnGround = grounded;
         if (grounded) {
             data.lastGroundLocation = now.clone();
@@ -72,6 +84,13 @@ public final class MovementMonitor implements Listener {
         // Server-granted flight (creative, /fly, plot plugins) - exempt from
         // the whole flight family. Honest players with /fly are never touched.
         boolean mayFly = player.getAllowFlight() || player.isFlying();
+
+        // bhop/launch memory: contact with slime or ice while grounded grants a
+        // grace window - the bounce arc that follows is legitimate physics far
+        // from the block that caused it (A10)
+        if (grounded && (GroundUtil.onSlimeOrIce(player) || nearSlimeBelow(player))) {
+            data.lastSlimeOrIceContact = nowMs;
+        }
 
         boolean gliding = player.isGliding() || player.isRiptiding();
         boolean climbing = GroundUtil.onClimbable(player);
@@ -90,15 +109,26 @@ public final class MovementMonitor implements Listener {
 
         double dx = 0, dy = 0, dz = 0;
         boolean fresh = last == null || !last.getWorld().equals(now.getWorld())
-                || last.distanceSquared(now) > 400;
+                || last.distanceSquared(now) > 400
+                || elapsedTicks > 10.0; // >0.5s since the last sample: deltas untrustworthy
         if (!fresh) {
             dx = now.getX() - last.getX();
             dy = now.getY() - last.getY();
             dz = now.getZ() - last.getZ();
         }
-        double hSpeed = Math.sqrt(dx * dx + dz * dz) / INTERVAL_TICKS; // blocks/tick
-        double vSpeed = dy / INTERVAL_TICKS;                           // blocks/tick (+ = rising)
+        double hDist = Math.sqrt(dx * dx + dz * dz);
+        double hSpeed = hDist / elapsedTicks;  // blocks/tick
+        double vSpeed = dy / elapsedTicks;     // blocks/tick (+ = rising)
         double prevVSpeed = data.lastVerticalSpeed;
+
+        // rolling activity distance for the AI clean-play gate (5-min window)
+        if (nowMs - data.distanceWindowStart > 300_000L) {
+            data.distanceWindowStart = nowMs;
+            data.windowDistance = 0;
+        }
+        if (!fresh) {
+            data.windowDistance += hDist;
+        }
 
         if (!fresh) {
             double yawDelta = Math.abs(wrapDegrees(now.getYaw() - last.getYaw()));
@@ -116,20 +146,23 @@ public final class MovementMonitor implements Listener {
         if (airborne && !fresh) {
             PlayerData.push(data.airborneSamples, Boolean.TRUE, PlayerData.AIR_CAP);
             PlayerData.push(data.risingSamples, vSpeed > 0.0, PlayerData.AIR_CAP);
-            data.airTicks += INTERVAL_TICKS;
+            data.airTicks += elapsedTicks;
         } else {
             PlayerData.push(data.airborneSamples, Boolean.FALSE, PlayerData.AIR_CAP);
             data.airTicks = 0;
         }
 
-        if (mayFly || gliding || liquid || climbing || levitating || exempt || grounded) {
+        if (mayFly || gliding || liquid || climbing || levitating || exempt || grounded
+                || inSlowMedium(player) || fresh) {
+            // fresh (incl. >0.5s sampling gaps): a stale hover charge must not
+            // survive a lag gap and combine with the next window
             data.hoverTicks = 0;
         } else if (!fresh) {
             boolean nearSlime = nearSlimeBelow(player);
             if (vSpeed > -0.04 && !nearSlime) {
-                data.hoverTicks += INTERVAL_TICKS;
+                data.hoverTicks += elapsedTicks;
             } else {
-                data.hoverTicks = Math.max(0, data.hoverTicks - INTERVAL_TICKS);
+                data.hoverTicks = Math.max(0, data.hoverTicks - elapsedTicks);
             }
         }
 
@@ -137,22 +170,22 @@ public final class MovementMonitor implements Listener {
         checkPhysicsDivergence(player, data, dy, vSpeed, airborne, grounded, climbing,
                 liquid, gliding, levitating, mayFly, exempt, fresh, lagMul);
         checkSpeed(player, data, hSpeed, grounded, mayFly, exempt, fresh, lagMul);
-        checkJesus(player, data, grounded, mayFly, exempt, fresh, vSpeed, lagMul);
+        checkJesus(player, data, grounded, mayFly, exempt, fresh, vSpeed, lagMul, elapsedTicks);
         checkFastClimb(player, data, vSpeed, climbing, exempt, fresh);
         checkWallClimb(player, data, vSpeed, grounded, climbing, liquid, gliding,
                 levitating, mayFly, exempt, fresh, lagMul);
         checkAirJump(player, data, vSpeed, prevVSpeed, airborne, grounded, climbing,
                 liquid, gliding, levitating, mayFly, exempt, fresh, lagMul);
-        checkPhase(player, data, mayFly, exempt, fresh, gliding);
+        checkPhase(player, data, mayFly, exempt, fresh, gliding, elapsedTicks);
         checkStep(player, data, vSpeed, grounded, mayFly, exempt, fresh, lagMul);
         checkLongJump(player, data, hSpeed, airborne, gliding, liquid, mayFly, exempt, fresh, lagMul);
         checkWaterWalk(player, data, hSpeed, liquid, grounded, mayFly, exempt, fresh, lagMul);
         checkElytraFly(player, data, vSpeed, hSpeed, gliding, mayFly, exempt, fresh, lagMul);
-        checkAirStuck(player, data, hSpeed, vSpeed, airborne, mayFly, exempt, fresh, lagMul);
+        checkAirStuck(player, data, hSpeed, vSpeed, airborne, mayFly, exempt, fresh, lagMul, elapsedTicks);
         checkNoSlow(player, data, hSpeed, grounded, mayFly, exempt, fresh, lagMul);
         checkNoWeb(player, data, hSpeed, mayFly, exempt, fresh, lagMul);
         checkGroundSpoof(player, data, grounded, climbing, liquid, gliding, mayFly, exempt, fresh, lagMul);
-        checkVelocityAbsorption(player, data, hSpeed * INTERVAL_TICKS, liquid, exempt);
+        checkVelocityAbsorption(player, data, dx, dz, liquid);
         trackFall(player, data, grounded, dy, mayFly, exempt, fresh);
 
         data.prevAirborne = airborne;
@@ -166,15 +199,18 @@ public final class MovementMonitor implements Listener {
      * travel distance. Honest players always travel most of it; an anti-KB
      * client barely moves.
      */
-    private void checkVelocityAbsorption(Player player, PlayerData data, double hDist,
-                                         boolean liquid, boolean exempt) {
+    private void checkVelocityAbsorption(Player player, PlayerData data,
+                                         double dx, double dz, boolean liquid) {
         Check kb = plugin.check(CheckType.VELOCITY);
         if (kb == null || !plugin.config().isEnabled(CheckType.VELOCITY)) return;
         if (data.pendingKbTime == 0L) return;
 
         long now = System.currentTimeMillis();
         if (now - data.pendingKbTime <= 700L) {
-            data.kbActual += hDist;
+            // A16: accumulate the PROJECTION of movement onto the knockback
+            // direction, not the total distance - a sprint-retreat no longer
+            // pads the number into "he took the knockback"
+            data.kbActual += dx * data.pendingKbDirX + dz * data.pendingKbDirZ;
             return;
         }
 
@@ -184,8 +220,21 @@ public final class MovementMonitor implements Listener {
         data.pendingKbLen = 0;
         data.kbActual = 0;
 
-        // shields legitimately eat knockback; water drag and grace periods too
-        if (liquid || exempt || player.isBlocking() || expected < 0.15) return;
+        // shields legitimately eat knockback; water drag too. NOTE: the global
+        // velocity exemption must NOT gate this evaluation - the knockback window
+        // (700ms) lives INSIDE every sensible exemption duration, which made this
+        // check dead code. Teleports during the window corrupt kbActual instead.
+        if (liquid || player.isBlocking() || expected < 0.15) return;
+        if (now - data.lastTeleport < 1000L || now - data.lastRespawn < 3000L) return;
+
+        // A16: a wall between the knockback origin and the expected landing eats
+        // the knockback legitimately - raycast the path and stand down on a hit
+        org.bukkit.util.RayTraceResult wall = player.getWorld().rayTraceBlocks(
+                new Location(player.getWorld(),
+                        data.pendingKbStartX, data.pendingKbStartY, data.pendingKbStartZ),
+                new org.bukkit.util.Vector(data.pendingKbDirX, 0, data.pendingKbDirZ),
+                expected + 0.5, org.bukkit.FluidCollisionMode.NEVER, true);
+        if (wall != null) return;
 
         double ratio = plugin.config().optDouble(CheckType.VELOCITY, "absorb-ratio", 0.35);
         if (actual < expected * ratio) {
@@ -223,7 +272,8 @@ public final class MovementMonitor implements Listener {
             return;
         }
         if (exempt || fresh || grounded || gliding || liquid || climbing || levitating
-                || !airborne || nearSlimeBelow(player) || GroundUtil.softLanding(player)) {
+                || !airborne || nearSlimeBelow(player) || GroundUtil.softLanding(player)
+                || inSlowMedium(player)) {
             data.flyDivergence = 0;
             data.expectedVy = 0;
             return;
@@ -293,7 +343,8 @@ public final class MovementMonitor implements Listener {
         Check lj = plugin.check(CheckType.LONGJUMP);
         if (lj == null || !plugin.config().isEnabled(CheckType.LONGJUMP)) return;
         if (!airborne || gliding || liquid || mayFly || exempt || fresh
-                || nearSlimeBelow(player) || GroundUtil.softLanding(player)) {
+                || nearSlimeBelow(player) || GroundUtil.softLanding(player)
+                || System.currentTimeMillis() - data.lastSlimeOrIceContact < 2500L) {
             data.longJumpBuffer = Math.max(0, data.longJumpBuffer - 1);
             return;
         }
@@ -354,7 +405,10 @@ public final class MovementMonitor implements Listener {
             return;
         }
         double maxRise = plugin.config().optDouble(CheckType.ELYTRAFLY, "max-rise", 0.08);
-        if (vSpeed > maxRise) {
+        // energy-exchange gate: pulling up from a dive converts speed into height
+        // (hSpeed high) and is core pilot skill; a hover-climb at low horizontal
+        // speed has no energy source and stays the cheat signature (A11)
+        if (vSpeed > maxRise && hSpeed < 1.0) {
             data.elytraRiseSamples++;
             if (data.elytraRiseSamples >= plugin.config().optInt(CheckType.ELYTRAFLY, "samples", 5) * lagMul) {
                 ef.flag(player, data, String.format(Locale.ROOT,
@@ -364,6 +418,9 @@ public final class MovementMonitor implements Listener {
             }
         } else {
             data.elytraRiseSamples = Math.max(0, data.elytraRiseSamples - 1);
+        }
+        if (hSpeed >= 1.0) {
+            data.elytraRiseSamples = 0; // dive pull-up: not a hover-climb
         }
 
         // terminal velocity of an unboosted elytra dive is ~2.5-2.7 b/t;
@@ -423,7 +480,7 @@ public final class MovementMonitor implements Listener {
     /** AirStuck: frozen mid-air (the "AirStuck" module found in most RU clients). */
     private void checkAirStuck(Player player, PlayerData data, double hSpeed, double vSpeed,
                                boolean airborne, boolean mayFly, boolean exempt,
-                               boolean fresh, int lagMul) {
+                               boolean fresh, int lagMul, double elapsedTicks) {
         Check stuck = plugin.check(CheckType.AIRSTUCK);
         if (stuck == null || !plugin.config().isEnabled(CheckType.AIRSTUCK)) return;
         if (!airborne || mayFly || exempt || fresh) {
@@ -431,10 +488,10 @@ public final class MovementMonitor implements Listener {
             return;
         }
         if (hSpeed < 0.005 && Math.abs(vSpeed) < 0.02) {
-            data.airStuckTicks += INTERVAL_TICKS;
+            data.airStuckTicks += elapsedTicks;
             int maxTicks = plugin.config().optInt(CheckType.AIRSTUCK, "max-ticks", 60) * lagMul;
             if (data.airStuckTicks > maxTicks) {
-                stuck.flag(player, data, "frozen mid-air " + data.airStuckTicks + " ticks", 3);
+                stuck.flag(player, data, "frozen mid-air " + Math.round(data.airStuckTicks) + " ticks", 3);
                 data.airStuckTicks = 0;
                 rollback(player, data);
             }
@@ -489,7 +546,7 @@ public final class MovementMonitor implements Listener {
             data.groundSpoofStreak++;
             if (data.groundSpoofStreak >= 3 * lagMul) {
                 spoof.flag(player, data, String.format(Locale.ROOT,
-                        "packet onGround=true while airborne %d ticks", data.airTicks), 2);
+                        "packet onGround=true while airborne %.0f ticks", data.airTicks), 2);
                 data.groundSpoofStreak = 0;
             }
         } else {
@@ -509,7 +566,7 @@ public final class MovementMonitor implements Listener {
         int maxHover = plugin.config().optInt(CheckType.FLY, "max-hover-ticks", 8) * lagMul;
         if (data.hoverTicks > maxHover * 2) { // hoverTicks already counts game ticks
             fly.flag(player, data, String.format(Locale.ROOT,
-                    "hover %d ticks (y=%.1f)", data.hoverTicks, player.getLocation().getY()), 2);
+                    "hover %.0f ticks (y=%.1f)", data.hoverTicks, player.getLocation().getY()), 2);
             data.hoverTicks = 0;
             rollback(player, data);
         }
@@ -535,9 +592,10 @@ public final class MovementMonitor implements Listener {
         double multiplier = plugin.config().optDouble(CheckType.SPEED, "multiplier", 1.45);
         double limit = 0.29 * multiplier * (player.getWalkSpeed() / 0.2f);
         if (player.isSprinting()) limit *= 1.05;
-        // vanilla sneak speed is ~0.13 b/tick; the old "*2.0" made the sneak cap
-        // ~0.40 b/t, letting a sneak-speedhack pass. Scale by walk speed like above.
-        if (player.isSneaking()) limit = 0.13 * multiplier * (player.getWalkSpeed() / 0.2f);
+        // vanilla sneak speed is ~0.065 b/tick (1.31 m/s); 0.10*multiplier gives
+        // ~0.145 - comfortably above Swift Sneak III (~0.094) yet half the old
+        // 0.13-based cap that let a sneak-speedhack through. Scale by walk speed.
+        if (player.isSneaking()) limit = 0.10 * multiplier * (player.getWalkSpeed() / 0.2f);
         int speedLevel = Compat.effectAmplifier(player, Compat.SPEED);
         if (speedLevel > 0) {
             limit *= 1.0 + 0.22 * speedLevel;
@@ -557,7 +615,8 @@ public final class MovementMonitor implements Listener {
     }
 
     private void checkJesus(Player player, PlayerData data, boolean grounded, boolean mayFly,
-                            boolean exempt, boolean fresh, double vSpeed, int lagMul) {
+                            boolean exempt, boolean fresh, double vSpeed, int lagMul,
+                            double elapsedTicks) {
         Check jesus = plugin.check(CheckType.JESUS);
         if (jesus == null || !plugin.config().isEnabled(CheckType.JESUS)) return;
         if (Compat.hasEffect(player, Compat.DOLPHINS) || mayFly) {
@@ -574,9 +633,9 @@ public final class MovementMonitor implements Listener {
                 * (depthStrider ? 3 : 1);
         if (!fresh && !exempt && !grounded && GroundUtil.onLiquidSurface(player)
                 && vSpeed > -0.05) {
-            data.jesusTicks += INTERVAL_TICKS;
+            data.jesusTicks += elapsedTicks;
             if (data.jesusTicks > maxTicks) {
-                jesus.flag(player, data, "walking on liquid " + data.jesusTicks + " ticks");
+                jesus.flag(player, data, "walking on liquid " + Math.round(data.jesusTicks) + " ticks");
                 data.jesusTicks = 0;
             }
         } else {
@@ -588,12 +647,23 @@ public final class MovementMonitor implements Listener {
                                 boolean climbing, boolean exempt, boolean fresh) {
         Check climb = plugin.check(CheckType.FASTCLIMB);
         if (climb == null || !plugin.config().isEnabled(CheckType.FASTCLIMB)) return;
-        if (!climbing || exempt || fresh) return;
+        if (!climbing || exempt || fresh) {
+            data.fastClimbBuffer = Math.max(0, data.fastClimbBuffer - 1);
+            return;
+        }
         double mult = plugin.config().optDouble(CheckType.FASTCLIMB, "multiplier", 1.6);
         double limit = 0.117 * mult;
         if (vSpeed > limit) {
-            climb.flag(player, data, String.format(Locale.ROOT,
-                    "climb %.2f b/t > %.2f", vSpeed, limit), 2);
+            // buffer like every other check: a single noisy sample at a window
+            // seam or a ladder->roof transition must not VL instantly
+            data.fastClimbBuffer++;
+            if (data.fastClimbBuffer >= plugin.config().optInt(CheckType.FASTCLIMB, "buffer", 3)) {
+                data.fastClimbBuffer = 0;
+                climb.flag(player, data, String.format(Locale.ROOT,
+                        "climb %.2f b/t > %.2f", vSpeed, limit), 2);
+            }
+        } else {
+            data.fastClimbBuffer = 0;
         }
     }
 
@@ -663,6 +733,14 @@ public final class MovementMonitor implements Listener {
             data.airJumpBuffer = Math.max(0, data.airJumpBuffer - 1);
             return;
         }
+        // bhop guard: a perfect bunny-hop touches ground for 1-2 ticks, which the
+        // 4Hz sampling can miss so every hop window looks "airborne". The per-tick
+        // ground cache knows better - recent contact means this spike is the next
+        // legitimate hop, not a mid-air double jump.
+        if (System.currentTimeMillis() - data.lastGroundedMs < 150L) {
+            data.airJumpBuffer = Math.max(0, data.airJumpBuffer - 1);
+            return;
+        }
         if (vSpeed > 0.25 && vSpeed > prevVSpeed + 0.10
                 && !nearSlimeBelow(player) && !GroundUtil.softLanding(player)) {
             data.airJumpBuffer++;
@@ -684,7 +762,7 @@ public final class MovementMonitor implements Listener {
      * Pistons grant velocity grace, so legit pushes are not counted.
      */
     private void checkPhase(Player player, PlayerData data, boolean mayFly,
-                            boolean exempt, boolean fresh, boolean gliding) {
+                            boolean exempt, boolean fresh, boolean gliding, double elapsedTicks) {
         Check phase = plugin.check(CheckType.PHASE);
         if (phase == null || !plugin.config().isEnabled(CheckType.PHASE)) {
             data.phaseTicks = 0;
@@ -695,18 +773,18 @@ public final class MovementMonitor implements Listener {
             return;
         }
         if (insideFullSolid(player)) {
-            data.phaseTicks += INTERVAL_TICKS;
+            data.phaseTicks += elapsedTicks;
             int minTicks = plugin.config().optInt(CheckType.PHASE, "min-ticks", 30);
             if (data.phaseTicks >= minTicks) {
                 Location loc = player.getLocation();
                 phase.flag(player, data, String.format(Locale.ROOT,
-                        "inside solid for %d ticks at %.1f %.1f %.1f",
+                        "inside solid for %.0f ticks at %.1f %.1f %.1f",
                         data.phaseTicks, loc.getX(), loc.getY(), loc.getZ()), 3);
                 data.phaseTicks = 0;
                 rollback(player, data);
             }
         } else {
-            data.phaseTicks = Math.max(0, data.phaseTicks - INTERVAL_TICKS);
+            data.phaseTicks = Math.max(0, data.phaseTicks - elapsedTicks);
         }
     }
 
@@ -734,8 +812,16 @@ public final class MovementMonitor implements Listener {
 
         if (grounded) {
             if (data.pendingFallDamage && System.currentTimeMillis() > data.pendingFallDeadline) {
-                // landed from a big fall, no fall damage event ever arrived
-                if (nofall != null && plugin.config().isEnabled(CheckType.NOFALL)) {
+                // landed from a big fall, no fall damage event ever arrived - but
+                // check the LANDING context first: water (even at the bottom),
+                // ladders grabbed mid-fall, cobweb, powder snow, hay/beds/wool
+                // all absorb falls legitimately and produce no damage event (A4)
+                boolean safeLanding = GroundUtil.inLiquid(player)
+                        || GroundUtil.softLanding(player)
+                        || GroundUtil.onClimbable(player)
+                        || inSlowMedium(player);
+                if (!safeLanding && nofall != null
+                        && plugin.config().isEnabled(CheckType.NOFALL)) {
                     nofall.flag(player, data, String.format(Locale.ROOT,
                             "landed from %.1f blocks without damage", data.pendingFallDistance), 3);
                 }
@@ -778,12 +864,30 @@ public final class MovementMonitor implements Listener {
 
     private boolean nearSlimeBelow(Player player) {
         Location loc = player.getLocation();
-        for (int y = -1; y >= -3; y--) {
-            if (loc.clone().add(0, y, 0).getBlock().getType() == Material.SLIME_BLOCK) {
+        World w = loc.getWorld();
+        int bx = loc.getBlockX(), by = loc.getBlockY(), bz = loc.getBlockZ();
+        for (int dy = -1; dy >= -3; dy--) {
+            if (w.getBlockAt(bx, by + dy, bz).getType() == Material.SLIME_BLOCK) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * Mediums where sinking/slow descent is LEGITIMATE physics and must not
+     * feed the hover or gravity-divergence checks: cobweb (terminal sink
+     * ~0.026 b/t), powder snow (standing on it with leather boots counts as
+     * airborne - the block is passable - yet dy ~ 0), sweet berry bushes.
+     */
+    private static boolean inSlowMedium(Player player) {
+        org.bukkit.block.Block at = player.getLocation().getBlock();
+        Material m = at.getType();
+        if (m == Material.COBWEB || m == Material.POWDER_SNOW
+                || m == Material.SWEET_BERRY_BUSH) {
+            return true;
+        }
+        return at.getRelative(0, -1, 0).getType() == Material.POWDER_SNOW;
     }
 
     private static float wrapDegrees(float deg) {

@@ -18,10 +18,14 @@ public final class GroundUtil {
     }
 
     /**
-     * Server-authoritative ground check based on block bounding boxes.
-     * Immune to client "on ground" packet spoofing.
+     * Server-authoritative ground check based on block bounding boxes AND
+     * standable entities. Immune to client "on ground" packet spoofing.
      */
     public static boolean isOnGround(Player player) {
+        return onBlockGround(player) || onEntityGround(player);
+    }
+
+    private static boolean onBlockGround(Player player) {
         BoundingBox box = player.getBoundingBox();
         double feet = box.getMinY();
         int y = (int) Math.floor(feet - 0.08);
@@ -44,6 +48,36 @@ public final class GroundUtil {
                     return true;
                 }
             }
+        }
+        return false;
+    }
+
+    /**
+     * Vanilla lets players STAND ON ENTITIES: other players (lobby piles), mobs,
+     * boats, shulkers, armor stands. Without this, 0.8s on somebody's head was
+     * "hover" -> Fly flag + GroundSpoof streak -> confirm-gate -> autokick,
+     * the single most mass-scale false positive possible on a busy server.
+     */
+    private static boolean onEntityGround(Player player) {
+        BoundingBox box = player.getBoundingBox();
+        double feet = box.getMinY();
+        for (org.bukkit.entity.Entity e : player.getWorld()
+                .getNearbyEntities(box.expand(0.15, 0.4, 0.15))) {
+            if (e.equals(player)) continue;
+            if (!(e instanceof org.bukkit.entity.LivingEntity)
+                    && !(e instanceof org.bukkit.entity.Boat)) {
+                continue;
+            }
+            if (e instanceof org.bukkit.entity.ArmorStand stand && stand.isMarker()) {
+                continue; // markers have no hitbox - you fall through them
+            }
+            BoundingBox eb = e.getBoundingBox();
+            // the entity's top must sit right at (or slightly under) the feet
+            if (eb.getMaxY() < feet - 0.35 || eb.getMaxY() > feet + 0.15) continue;
+            // ...and overlap the player horizontally
+            if (eb.getMaxX() < box.getMinX() || eb.getMinX() > box.getMaxX()) continue;
+            if (eb.getMaxZ() < box.getMinZ() || eb.getMinZ() > box.getMaxZ()) continue;
+            return true;
         }
         return false;
     }

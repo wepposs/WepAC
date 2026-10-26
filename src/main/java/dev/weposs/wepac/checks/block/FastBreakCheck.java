@@ -38,13 +38,23 @@ public final class FastBreakCheck extends Check {
         PlayerData data = plugin.data().get(player);
         long now = System.currentTimeMillis();
 
-        // Nuker radius check (applies to every block, including soft ones)
+        // Nuker radius check (applies to every block, including soft ones).
+        // The distance is measured at BREAK COMPLETION, but the break started up
+        // to seconds ago: a high-ping player can start at 4.5 blocks and step back
+        // during the animation. Slack = ping * retreat speed (~4 b/s sprint),
+        // plus a 2-event confirmation buffer so a single desynced break never VLs.
         double dist = player.getEyeLocation().toVector()
                 .distance(event.getBlock().getBoundingBox().getCenter());
-        double maxDist = 4.75 + Math.min(0.75, player.getPing() / 1000.0);
+        double maxDist = 4.75 + Math.min(2.0, player.getPing() / 1000.0 * 4.0);
         if (dist > maxDist) {
-            flag(player, data, String.format(Locale.ROOT,
-                    "broke %s at %.2f blocks (max %.2f)", type.name(), dist, maxDist), 3);
+            data.nukerBuffer++;
+            if (data.nukerBuffer >= 2) {
+                data.nukerBuffer = 0;
+                flag(player, data, String.format(Locale.ROOT,
+                        "broke %s at %.2f blocks (max %.2f)", type.name(), dist, maxDist), 3);
+            }
+        } else {
+            data.nukerBuffer = Math.max(0, data.nukerBuffer - 1);
         }
 
         // instant-break blocks (plants, torches, glass...) and soft blocks are ignored

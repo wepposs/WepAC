@@ -18,7 +18,11 @@ public final class NoFallCheck extends Check {
         super(plugin, CheckType.NOFALL);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    // deliberately WITHOUT ignoreCancelled: a CANCELLED fall-damage event means a
+    // protection plugin (WorldGuard deny, god mode, region heal) absorbed the
+    // fall - the server DID expect damage and something legitimate ate it.
+    // A NoFall cheat cannot cancel server events, so this cannot be abused.
+    @EventHandler(priority = EventPriority.MONITOR)
     public void onFallDamage(EntityDamageEvent event) {
         if (event.getCause() != EntityDamageEvent.DamageCause.FALL) return;
         if (!(event.getEntity() instanceof Player player)) return;

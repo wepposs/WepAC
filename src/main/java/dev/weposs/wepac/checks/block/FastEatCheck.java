@@ -32,7 +32,11 @@ public final class FastEatCheck extends Check {
         Player player = event.getPlayer();
         if (!enabled() || bypass(player)) return;
 
-        Material item = player.getInventory().getItemInMainHand().getType();
+        // the event's hand item covers OFF-HAND consumption too (main-hand-only
+        // tracking left a FastEat cheat in the second hand invisible)
+        Material item = event.getItem() != null
+                ? event.getItem().getType()
+                : player.getInventory().getItemInMainHand().getType();
         if (!item.isEdible() || item == Material.DRIED_KELP) return;
 
         PlayerData data = plugin.data().get(player);

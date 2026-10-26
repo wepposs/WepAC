@@ -52,9 +52,17 @@ public final class AutoClickerCheck extends Check {
         for (Long t : data.clickTimes) {
             if (now - t <= 1000L) cps++;
         }
-        int maxCps = plugin.config().optInt(CheckType.AUTOCLICKER, "max-cps", 25);
+        int maxCps = plugin.config().optInt(CheckType.AUTOCLICKER, "max-cps", 28);
         if (cps > maxCps) {
-            flag(player, data, cps + " cps > " + maxCps, 3);
+            // confirmation buffer: hardcore drag/butterfly clickers legitimately
+            // burst 25-30 CPS for short stretches - one burst must not VL
+            data.cpsBuffer++;
+            if (data.cpsBuffer >= plugin.config().optInt(CheckType.AUTOCLICKER, "cps-buffer", 2)) {
+                data.cpsBuffer = 0;
+                flag(player, data, cps + " cps > " + maxCps, 3);
+            }
+        } else {
+            data.cpsBuffer = 0;
         }
 
         // consistency check over the 3s buffer

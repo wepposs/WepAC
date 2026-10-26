@@ -16,6 +16,13 @@ public final class AlertManager {
 
     private final WepAC plugin;
     private final Set<UUID> disabled = new HashSet<>();
+    /**
+     * Per player+check message throttle (main thread only). A reach cheat in a
+     * fight flags on EVERY hit; without this the staff chat is dozens of
+     * messages per second. VL bookkeeping and punishments are NOT affected -
+     * only the chat/console message is suppressed.
+     */
+    private final java.util.Map<String, Long> lastSent = new java.util.HashMap<>();
 
     public AlertManager(WepAC plugin) {
         this.plugin = plugin;
@@ -31,7 +38,25 @@ public final class AlertManager {
         return !disabled.contains(staff.getUniqueId());
     }
 
+    /** Drop per-player state on quit so neither set grows without bound. */
+    public void forget(UUID id) {
+        disabled.remove(id);
+        String prefix = id + "|";
+        lastSent.keySet().removeIf(k -> k.startsWith(prefix));
+    }
+
     public void send(Player flagged, CheckType type, int vl, String info) {
+        long now = System.currentTimeMillis();
+        long cooldown = plugin.config().alertCooldownMs;
+        if (cooldown > 0) {
+            String key = flagged.getUniqueId() + "|" + type.name();
+            Long prev = lastSent.get(key);
+            if (prev != null && now - prev < cooldown) return; // throttled message only
+            if (lastSent.size() > 2048) {
+                lastSent.values().removeIf(t -> now - t > 60_000L);
+            }
+            lastSent.put(key, now);
+        }
         String message = format(flagged, type, vl, info,
                 String.format(Locale.ROOT, "%.2f", aiProbability(flagged)))
                 + statusTag(flagged);
@@ -89,6 +114,8 @@ public final class AlertManager {
     }
 
     private String format(Player player, CheckType type, int vl, String info, String ai) {
+        // D5: staff need the location to teleport in and adjudicate the flag
+        org.bukkit.Location loc = player.getLocation();
         String msg = plugin.config().alertFormat()
                 .replace("{prefix}", plugin.config().prefix())
                 .replace("{player}", player.getName())
@@ -96,6 +123,10 @@ public final class AlertManager {
                 .replace("{vl}", String.valueOf(vl))
                 .replace("{ping}", String.valueOf(player.getPing()))
                 .replace("{ai}", ai)
+                .replace("{world}", loc.getWorld() == null ? "?" : loc.getWorld().getName())
+                .replace("{x}", String.format(Locale.ROOT, "%.0f", loc.getX()))
+                .replace("{y}", String.format(Locale.ROOT, "%.0f", loc.getY()))
+                .replace("{z}", String.format(Locale.ROOT, "%.0f", loc.getZ()))
                 .replace("{info}", info == null ? "" : info);
         return WepAC.color(msg);
     }

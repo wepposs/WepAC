@@ -26,6 +26,7 @@ import dev.weposs.wepac.command.ACCommand;
 import dev.weposs.wepac.config.ConfigManager;
 import dev.weposs.wepac.data.DataManager;
 import dev.weposs.wepac.data.PlayerData;
+import dev.weposs.wepac.data.ViolationStore;
 import dev.weposs.wepac.listener.ConnectionListener;
 import dev.weposs.wepac.punish.PunishmentManager;
 import dev.weposs.wepac.record.RecordManager;
@@ -48,6 +49,7 @@ public final class WepAC extends JavaPlugin {
     private ViolationManager violationManager;
     private PunishmentManager punishmentManager;
     private RecordManager recordManager;
+    private ViolationStore violationStore;
     private AIBrain aiBrain;
     private dev.weposs.wepac.packet.PacketSniffer packetSniffer;
     private final List<Check> checks = new ArrayList<>();
@@ -55,6 +57,31 @@ public final class WepAC extends JavaPlugin {
     @Override
     public void onEnable() {
         instance = this;
+
+        // E3: Folia has no global main thread - every scheduler call and the
+        // whole monitor model is invalid there. Refuse loudly instead of dying
+        // in a random place later.
+        boolean folia;
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+            folia = true;
+        } catch (ClassNotFoundException e) {
+            folia = false;
+        }
+        if (folia) {
+            getLogger().severe("WepAC does not support Folia (no global main thread). Disabling.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+        // E1: fail fast with a clear message instead of NoSuchFieldError somewhere
+        // deep inside a check (SONIC_BOOM, MACE, registry APIs are 1.19+/1.21+)
+        String serverVersion = Bukkit.getBukkitVersion(); // e.g. "1.21.11-R0.1-SNAPSHOT"
+        if (!serverVersion.startsWith("1.21")) {
+            getLogger().severe("WepAC requires Minecraft 1.21.x - this server reports "
+                    + serverVersion + ". Disabling.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
 
         configManager = new ConfigManager(this);
         configManager.load();
@@ -64,6 +91,7 @@ public final class WepAC extends JavaPlugin {
         punishmentManager = new PunishmentManager(this);
         violationManager = new ViolationManager(this);
         recordManager = new RecordManager(this);
+        violationStore = new ViolationStore(this);
         aiBrain = new AIBrain(this);
 
         if (configManager.recordEnabled) {
@@ -71,6 +99,14 @@ public final class WepAC extends JavaPlugin {
                 recordManager.load();
             } catch (Throwable t) {
                 getLogger().severe("Could not load records.yml (continuing with empty records): " + t);
+            }
+        }
+        if (configManager.vlPersistEnabled) {
+            try {
+                violationStore.load();
+            } catch (Throwable t) {
+                getLogger().severe("Could not load " + configManager.vlPersistFile
+                        + " (continuing with empty VL history): " + t);
             }
         }
         if (configManager.aiEnabled) {
@@ -97,6 +133,8 @@ public final class WepAC extends JavaPlugin {
             try {
                 packetSniffer = new dev.weposs.wepac.packet.PacketSniffer(this);
                 packetSniffer.start();
+                // per-packet gravity simulation, fed by the sniffer's move queue
+                new dev.weposs.wepac.packet.PacketPhysics(this);
             } catch (Throwable t) {
                 packetSniffer = null;
                 getLogger().severe("Packet sniffer failed to start (packet checks disabled): " + t);
@@ -122,8 +160,12 @@ public final class WepAC extends JavaPlugin {
         if (aiBrain != null && configManager != null && configManager.aiEnabled) {
             aiBrain.save();
         }
+        // shutdown: async tasks may no longer run - flush synchronously
         if (recordManager != null && configManager != null && configManager.recordEnabled) {
-            recordManager.save();
+            recordManager.flushSync();
+        }
+        if (violationStore != null && configManager != null && configManager.vlPersistEnabled) {
+            violationStore.flushSync();
         }
         getLogger().info("WepAC disabled.");
     }
@@ -156,9 +198,13 @@ public final class WepAC extends JavaPlugin {
         // flagging driven by MovementMonitor / PacketSniffer
         for (CheckType t : new CheckType[]{CheckType.STEP, CheckType.NOSLOW, CheckType.WATERWALK,
                 CheckType.ELYTRAFLY, CheckType.AIRSTUCK, CheckType.LONGJUMP, CheckType.NOWEB,
-                CheckType.TIMER, CheckType.BLINK, CheckType.BADPACKETS, CheckType.GROUND_SPOOF,
-                CheckType.VELOCITY}) {
+                CheckType.TIMER, CheckType.BLINK, CheckType.BADPACKETS, CheckType.PACKETFLY,
+                CheckType.GROUND_SPOOF, CheckType.VELOCITY}) {
             checks.add(new dev.weposs.wepac.check.SimpleCheck(this, t));
+        }
+        checkByType.clear();
+        for (Check c : checks) {
+            checkByType.put(c.type(), c);
         }
     }
 
@@ -168,6 +214,8 @@ public final class WepAC extends JavaPlugin {
         }
         Bukkit.getPluginManager().registerEvents(new MovementMonitor(this), this);
         Bukkit.getPluginManager().registerEvents(new ConnectionListener(this), this);
+        // always-on collectors: the AI features must not depend on check toggles
+        Bukkit.getPluginManager().registerEvents(new dev.weposs.wepac.data.TelemetryCollector(this), this);
         if (configManager.aiEnabled) {
             Bukkit.getPluginManager().registerEvents(
                     new dev.weposs.wepac.ai.CombatProfiler(this), this);
@@ -175,10 +223,13 @@ public final class WepAC extends JavaPlugin {
     }
 
     private void startTasks() {
-        // 20Hz position history for lag-compensated reach
+        // 20Hz position history for lag-compensated reach + the ONE per-tick
+        // server ground-truth computation every layer reads (F6: the block scan
+        // incl. entity support runs once per tick, not separately at 4Hz and 20Hz)
         Bukkit.getScheduler().runTaskTimer(this, () -> {
             long now = System.currentTimeMillis();
             for (Player p : Bukkit.getOnlinePlayers()) {
+                if (p.hasPermission("wepac.bypass")) continue; // never checked - don't track
                 PlayerData d = dataManager.get(p);
                 org.bukkit.Location loc = p.getLocation();
                 d.posHistory.addLast(new double[]{now, loc.getX(), loc.getY(), loc.getZ()});
@@ -186,8 +237,20 @@ public final class WepAC extends JavaPlugin {
                         && now - d.posHistory.peekFirst()[0] > 2000L) {
                     d.posHistory.pollFirst();
                 }
+                boolean grounded = dev.weposs.wepac.util.GroundUtil.isOnGround(p);
+                d.groundTruth = grounded;
+                d.groundTruthAt = now;
+                d.serverOnGround = grounded;
+                if (grounded) d.lastGroundedMs = now;
             }
         }, 1L, 1L);
+
+        // batched persistence flush (records + VL): YAML snapshot on the main
+        // thread, disk write async - strikes/quits never block on file IO
+        Bukkit.getScheduler().runTaskTimer(this, () -> {
+            recordManager.saveNow();
+            violationStore.saveNow();
+        }, 600L, 600L);
 
         // VL decay - runs on the MAIN thread: it mutates PlayerData.violations
         // (EnumMap) and firedStages, which the main thread also reads/writes.
@@ -241,19 +304,25 @@ public final class WepAC extends JavaPlugin {
     public void reload() {
         configManager.load();
         if (aiBrain != null) {
-            aiBrain.save();
+            // model save touches the disk - never on the main thread
+            Bukkit.getScheduler().runTaskAsynchronously(this, aiBrain::save);
         }
+        // task intervals (decay/score/train/save periods) are captured when the
+        // repeating tasks are registered; changing them needs a server restart
+        getLogger().info("Config reloaded. NOTE: task intervals (decay/AI score/train/save) "
+                + "apply after a server restart.");
     }
 
     public List<Check> checks() {
         return checks;
     }
 
+    private final java.util.Map<CheckType, Check> checkByType =
+            new java.util.EnumMap<>(CheckType.class);
+
+    /** O(1) lookup - called from per-packet/per-sample hot paths. */
     public Check check(CheckType type) {
-        for (Check c : checks) {
-            if (c.type() == type) return c;
-        }
-        return null;
+        return checkByType.get(type);
     }
 
     public ConfigManager config() {
@@ -278,6 +347,10 @@ public final class WepAC extends JavaPlugin {
 
     public RecordManager records() {
         return recordManager;
+    }
+
+    public ViolationStore vlStore() {
+        return violationStore;
     }
 
     public dev.weposs.wepac.packet.PacketSniffer packets() {

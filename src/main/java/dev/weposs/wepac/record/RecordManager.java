@@ -43,10 +43,13 @@ public final class RecordManager {
         public final List<String> notes = new ArrayList<>();
     }
 
+    // main-thread only (SimpleDateFormat is not thread-safe; all record
+    // mutations happen on the main thread, the async flush writes a snapshot)
     private static final SimpleDateFormat DATE = new SimpleDateFormat("dd.MM HH:mm");
 
     private final WepAC plugin;
     private final Map<UUID, Record> records = new ConcurrentHashMap<>();
+    private volatile boolean dirty = false;
 
     public RecordManager(WepAC plugin) {
         this.plugin = plugin;
@@ -82,7 +85,30 @@ public final class RecordManager {
         plugin.getLogger().info("Loaded " + records.size() + " criminal records.");
     }
 
+    /**
+     * Marks the store dirty; the actual disk write is batched by the periodic
+     * flush task. Strikes must never block the main thread on YAML IO.
+     */
     public void save() {
+        dirty = true;
+    }
+
+    /** Main thread: snapshot the YAML, write it on an async thread. */
+    public void saveNow() {
+        if (!dirty) return;
+        dirty = false;
+        YamlConfiguration y = buildYaml();
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> writeYaml(y));
+    }
+
+    /** Blocking write for shutdown, when async tasks may no longer run. */
+    public void flushSync() {
+        if (!dirty) return;
+        dirty = false;
+        writeYaml(buildYaml());
+    }
+
+    private YamlConfiguration buildYaml() {
         YamlConfiguration y = new YamlConfiguration();
         for (Map.Entry<UUID, Record> e : records.entrySet()) {
             String key = e.getKey().toString();
@@ -94,13 +120,22 @@ public final class RecordManager {
             y.set(key + ".kicks", r.kicks);
             y.set(key + ".bans", r.bans);
             y.set(key + ".since", r.since);
-            y.set(key + ".notes", r.notes);
+            synchronized (r.notes) {
+                y.set(key + ".notes", new ArrayList<>(r.notes));
+            }
         }
+        return y;
+    }
+
+    private void writeYaml(YamlConfiguration y) {
         try {
             File f = file();
             File parent = f.getParentFile();
             if (parent != null && !parent.exists()) parent.mkdirs();
-            y.save(f);
+            // temp+move: a crash mid-write must not corrupt the record base
+            File tmp = new File(parent, f.getName() + ".tmp");
+            y.save(tmp);
+            dev.weposs.wepac.ai.AIBrain.atomicReplace(tmp, f);
         } catch (IOException ex) {
             plugin.getLogger().severe("Failed to save records: " + ex.getMessage());
         }
@@ -122,8 +157,14 @@ public final class RecordManager {
         return records.computeIfAbsent(id, k -> new Record());
     }
 
+    /**
+     * Read-only status. Must NOT create entries: this runs on every alert
+     * (statusTag) and threshold query, and computeIfAbsent here grew the map
+     * with one Record per player ever seen.
+     */
     public Status status(UUID id) {
-        return get(id).status;
+        Record r = records.get(id);
+        return r == null ? Status.CLEAN : r.status;
     }
 
     /** Threshold multiplier for watched/wanted players (stricter checks). */
@@ -193,8 +234,13 @@ public final class RecordManager {
                     .replace("%check%", type.displayName())
                     .replace("%score%", String.format(Locale.ROOT, "%.0f", score));
             plugin.ai().labelFromPunishment(player);
-            Bukkit.getScheduler().runTask(plugin, () ->
-                    Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd));
+            Bukkit.getScheduler().runTask(plugin, () -> {
+                boolean ok = Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
+                if (!ok) {
+                    plugin.getLogger().warning("Record-ban command was NOT executed "
+                            + "(is a punishment plugin installed?): " + cmd);
+                }
+            });
             plugin.getLogger().info("RECORD-BAN " + player.getName() + " score=" + score);
             plugin.alerts().rage(player, "повторные читы после учёта, score " + String.format(Locale.ROOT, "%.0f", score));
         } else {
@@ -242,9 +288,29 @@ public final class RecordManager {
         };
     }
 
+    /**
+     * D2: WATCH must not be a life sentence - one false-positive kick used to
+     * mean 0.6x thresholds and join announcements forever. After expire-days
+     * without a strike the watch lapses back to CLEAN (notes are preserved;
+     * WANTED stays until manually cleared - that is a deliberate ban record).
+     */
+    private void expireIfStale(UUID id) {
+        Record r = records.get(id);
+        if (r == null || r.status != Status.WATCH) return;
+        int days = plugin.config().recordExpireDays;
+        if (days <= 0 || r.since <= 0L) return;
+        if (System.currentTimeMillis() - r.since > days * 86_400_000L) {
+            r.status = Status.CLEAN;
+            r.notes.add(DATE.format(new Date()) + " WATCH auto-expired ("
+                    + days + "d without strikes)");
+            save();
+        }
+    }
+
     /** Join announcement for staff. */
     public void announceJoin(Player player) {
         if (!plugin.config().recordEnabled) return;
+        expireIfStale(player.getUniqueId());
         Status s = status(player.getUniqueId());
         if (s == Status.WATCH) {
             plugin.alerts().broadcastRaw("&6&l[УЧЁТ]&r &7" + player.getName()

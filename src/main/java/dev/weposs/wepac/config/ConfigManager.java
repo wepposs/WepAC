@@ -30,6 +30,12 @@ public final class ConfigManager {
     private String prefix;
     private String alertFormat;
     private boolean alertConsole;
+    public long alertCooldownMs;
+
+    // cross-session VL persistence
+    public boolean vlPersistEnabled;
+    public String vlPersistFile;
+    public int vlExpireDays;
 
     private int decayInterval;
     private int decayAmount;
@@ -44,10 +50,15 @@ public final class ConfigManager {
     public int confirmMinDistinctChecks;
     public double confirmSingleVlMultiplier;
     public double confirmAiProbability;
+    /** punishment verbs that require confirmation; UNKNOWN verbs count as harsh
+     *  (conservative), only safeVerbs are exempt */
+    public List<String> safeVerbs = new ArrayList<>();
 
     // police record ("учёт")
     public boolean recordEnabled;
     public String recordFile;
+    /** WATCH auto-downgrades to CLEAN after this many days without strikes (0 = never) */
+    public int recordExpireDays;
     public double watchMultiplier;
     public double wantedMultiplier;
     public double reviewBanScore;
@@ -59,6 +70,7 @@ public final class ConfigManager {
     public boolean clientDetectEnabled;
     public boolean clientNotifyStaff;
     public boolean clientWatchUnknown;
+    public boolean clientBanOnBrand;
     public String clientBanCommand;
     public List<String> cheatBrands = new ArrayList<>();
     public List<String> watchBrands = new ArrayList<>();
@@ -66,7 +78,7 @@ public final class ConfigManager {
 
     // packet layer
     public boolean packetEnabled;
-    public int timerMaxRate;
+    public double timerMaxRate;
     public long timerSustainMs;
     public long blinkTimeoutMs;
 
@@ -105,6 +117,9 @@ public final class ConfigManager {
     private final Map<CheckType, Boolean> enabled = new HashMap<>();
     private final Map<CheckType, Integer> thresholds = new HashMap<>();
     private final Map<String, Object> options = new HashMap<>();
+    /** per-world check disables (D3): minigame/parkour worlds need Fly/Speed/Jesus
+     *  off for EVERYONE, not per-player bypass permissions */
+    private final Map<CheckType, java.util.Set<String>> worldDisabled = new HashMap<>();
 
     public ConfigManager(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -119,6 +134,11 @@ public final class ConfigManager {
         alertFormat = color(c.getString("alerts.format",
                 "{prefix}&7{player} &8| &c{check} &8| &7VL {vl} &8| &7ping {ping}ms &8| &7AI {ai} &8| &f{info}"));
         alertConsole = c.getBoolean("alerts.console", true);
+        alertCooldownMs = Math.max(0L, c.getLong("alerts.cooldown-ms", 1000L));
+
+        vlPersistEnabled = c.getBoolean("vl-persistence.enabled", true);
+        vlPersistFile = c.getString("vl-persistence.file", "vl.yml");
+        vlExpireDays = Math.max(1, c.getInt("vl-persistence.expire-days", 7));
 
         decayInterval = Math.max(5, c.getInt("decay.interval", 30));
         decayAmount = Math.max(1, c.getInt("decay.amount", 1));
@@ -131,21 +151,35 @@ public final class ConfigManager {
         confirmMinDistinctChecks = Math.max(1, c.getInt("confirm.min-distinct-checks", 2));
         confirmSingleVlMultiplier = c.getDouble("confirm.single-check-vl-multiplier", 1.5);
         confirmAiProbability = c.getDouble("confirm.ai-probability", 0.97);
+        safeVerbs = new ArrayList<>();
+        for (String s : c.getStringList("confirm.safe-commands")) {
+            safeVerbs.add(s.toLowerCase(Locale.ROOT).trim());
+        }
+        if (safeVerbs.isEmpty()) {
+            // sensible non-punishing defaults; ANY verb outside this list is
+            // treated as harsh (D1: an unknown "vban"/"sanction" alias must not
+            // slip past the confirmation gate)
+            safeVerbs.addAll(List.of("broadcast", "say", "warn", "msg", "tell", "title", "me"));
+        }
 
         recordEnabled = c.getBoolean("record.enabled", true);
         recordFile = c.getString("record.file", "records.yml");
+        recordExpireDays = Math.max(0, c.getInt("record.expire-days", 30));
         watchMultiplier = c.getDouble("record.watch-threshold-multiplier", 0.6);
         wantedMultiplier = c.getDouble("record.wanted-threshold-multiplier", 0.4);
         reviewBanScore = c.getDouble("record.review-ban-score", 100);
         recordBanCommand = c.getString("record.ban-command",
                 "tempban %player% 7d &c[WepAC] Рецидив после учёта (%check%)");
         rageMessage = c.getString("record.rage-message",
-                "&4&l%player%&c&l, ЧИТАК ЕБУЧИЙ СУКА БАНЬТЕ БЛЯТЬ БЫСТРЕЕ НАХУЙ");
+                "&4&l%player% &c&l— В РОЗЫСКЕ: подтверждённый читер. Баньте немедленно, вердикт окончательный.");
         rageRepeat = Math.max(1, c.getInt("record.rage-repeat", 3));
 
         clientDetectEnabled = c.getBoolean("client-detect.enabled", true);
         clientNotifyStaff = c.getBoolean("client-detect.notify-staff", true);
         clientWatchUnknown = c.getBoolean("client-detect.watch-unknown", true);
+        // brands are self-reported; default is watch-not-ban so an unlucky
+        // modpack brand can never cause an automated false ban
+        clientBanOnBrand = c.getBoolean("client-detect.ban-on-brand", false);
         clientBanCommand = c.getString("client-detect.ban-command",
                 "ban %player% &c[WepAC] Читерский клиент: %client%");
         cheatBrands = new ArrayList<>();
@@ -165,7 +199,9 @@ public final class ConfigManager {
         }
 
         packetEnabled = c.getBoolean("packet-sniffer.enabled", true);
-        timerMaxRate = c.getInt("packet-sniffer.timer-max-rate", 21);
+        // 20.5 (not 21): vanilla is exactly 20/s - at an integer cap of 21 a
+        // 1.05x timer (21.0 packets/s) sailed through the > comparison
+        timerMaxRate = c.getDouble("packet-sniffer.timer-max-rate", 20.5);
         timerSustainMs = c.getLong("packet-sniffer.timer-sustain-ms", 2500L);
         blinkTimeoutMs = c.getLong("packet-sniffer.blink-timeout-ms", 2000L);
 
@@ -200,7 +236,7 @@ public final class ConfigManager {
         aiAlertThreshold = c.getDouble("ai.alert-threshold", 0.90);
         aiAdaptiveThresholds = c.getBoolean("ai.adaptive-thresholds", true);
         aiAdaptiveMin = c.getDouble("ai.adaptive-min-multiplier", 0.65);
-        aiAdaptiveMax = c.getDouble("ai.adaptive-max-multiplier", 1.30);
+        aiAdaptiveMax = c.getDouble("ai.adaptive-max-multiplier", 1.15);
         aiPunishByAi = c.getBoolean("ai.punish-by-ai", false);
         aiPunishProbability = c.getDouble("ai.punish-probability", 0.995);
 
@@ -214,16 +250,19 @@ public final class ConfigManager {
         enabled.clear();
         thresholds.clear();
         options.clear();
+        worldDisabled.clear();
         ConfigurationSection checks = c.getConfigurationSection("checks");
         if (checks != null) {
             for (CheckType type : CheckType.values()) {
                 String key = type.configKey();
-                if (type == CheckType.AI || type == CheckType.GROUND_SPOOF) {
-                    enabled.put(type, true);
-                    thresholds.put(type, 30);
-                }
                 enabled.put(type, checks.getBoolean(key + ".enabled", true));
                 thresholds.put(type, Math.max(1, checks.getInt(key + ".threshold", 20)));
+                List<String> worlds = checks.getStringList(key + ".disabled-worlds");
+                if (worlds != null && !worlds.isEmpty()) {
+                    java.util.Set<String> set = new java.util.HashSet<>();
+                    for (String w : worlds) set.add(w.toLowerCase(Locale.ROOT).trim());
+                    worldDisabled.put(type, set);
+                }
                 ConfigurationSection sec = checks.getConfigurationSection(key);
                 if (sec != null) {
                     for (String opt : sec.getKeys(false)) {
@@ -260,6 +299,12 @@ public final class ConfigManager {
 
     public boolean isEnabled(CheckType type) {
         return enabled.getOrDefault(type, true);
+    }
+
+    /** True when this check is switched off for the given world (disabled-worlds). */
+    public boolean worldDisabled(CheckType type, String world) {
+        java.util.Set<String> set = worldDisabled.get(type);
+        return set != null && world != null && set.contains(world.toLowerCase(Locale.ROOT));
     }
 
     public int threshold(CheckType type) {

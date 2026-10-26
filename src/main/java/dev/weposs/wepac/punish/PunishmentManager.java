@@ -47,8 +47,15 @@ public final class PunishmentManager {
         // Confirmed punishment -> training data for the AI (before the player leaves)
         plugin.ai().labelFromPunishment(player);
 
-        Bukkit.getScheduler().runTask(plugin, () ->
-                Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd));
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            boolean ok = Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
+            if (!ok) {
+                // bare Spigot has no /tempban: without this warning the strike and
+                // the record would be written while nothing actually happened
+                plugin.getLogger().warning("Punishment command was NOT executed "
+                        + "(is a punishment plugin installed?): " + cmd);
+            }
+        });
 
         plugin.getLogger().info("Punished " + player.getName() + " [" + type.displayName()
                 + " VL " + vl + "]: " + cmd);
@@ -92,10 +99,15 @@ public final class PunishmentManager {
         return head;
     }
 
-    private static boolean isHarsh(String cmd) {
+    /**
+     * D1: verb lists are configuration, and UNKNOWN verbs are treated as harsh
+     * (conservative). The old hardcoded list let custom aliases ("vban",
+     * "sanction", pack-specific CMI commands) execute WITHOUT the confirmation
+     * gate - unconfirmed auto-punishments.
+     */
+    private boolean isHarsh(String cmd) {
         String w = commandWord(cmd);
-        return w.equals("kick") || w.equals("ban") || w.equals("tempban")
-                || w.equals("ban-ip") || w.equals("banip") || w.equals("tkb");
+        return !plugin.config().safeVerbs.contains(w);
     }
 
     private static boolean isBan(String cmd) {

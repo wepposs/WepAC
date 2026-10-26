@@ -37,15 +37,20 @@ public final class ScaffoldCheck extends Check {
                 && placed.getZ() == belowFeet.getZ();
 
         PlayerData data = plugin.data().get(player);
-        double maxPitch = plugin.config().optDouble(CheckType.SCAFFOLD, "max-pitch", 25.0);
+        double maxPitch = plugin.config().optDouble(CheckType.SCAFFOLD, "max-pitch", 20.0);
         int bufferNeeded = plugin.config().optInt(CheckType.SCAFFOLD, "buffer", 4);
 
         if (belowPlayer && loc.getPitch() < maxPitch && data.lastHorizontalSpeed > 0.08) {
             data.scaffoldBuffer++;
             if (data.scaffoldBuffer >= bufferNeeded) {
+                // severity 1 (informational): god-bridge/neo-bridge are LEGIT
+                // vanilla techniques with exactly this signature. A scaffold
+                // tower still escalates via sustained VL and cross-check
+                // confirmation, but one long bridge session must not walk an
+                // honest builder into the kick stage.
                 flag(player, data, String.format(Locale.ROOT,
-                        "block below feet while pitch %.0f, speed %.2f b/t",
-                        loc.getPitch(), data.lastHorizontalSpeed), 2);
+                        "block below feet while pitch %.0f, speed %.2f b/t (or god-bridge)",
+                        loc.getPitch(), data.lastHorizontalSpeed), 1);
                 data.scaffoldBuffer = 0;
             }
         } else {

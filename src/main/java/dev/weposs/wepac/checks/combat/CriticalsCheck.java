@@ -4,7 +4,6 @@ import dev.weposs.wepac.WepAC;
 import dev.weposs.wepac.check.Check;
 import dev.weposs.wepac.check.CheckType;
 import dev.weposs.wepac.data.PlayerData;
-import dev.weposs.wepac.util.GroundUtil;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -40,6 +39,14 @@ public final class CriticalsCheck extends Check {
         PlayerData data = plugin.data().get(attacker);
         long now = System.currentTimeMillis();
 
+        // time-decay like the KillAura buffers: isolated suspicious hits far apart
+        // must not slowly ripen into a flag across an entire fight
+        if (now - data.lastCritAttackAt > 4000L) {
+            data.critsBuffer = 0;
+            data.critRhythmBuffer = 0;
+        }
+        data.lastCritAttackAt = now;
+
         if (data.velocityExempt()) {
             data.critsBuffer = Math.max(0, data.critsBuffer - 1);
             return;
@@ -52,7 +59,7 @@ public final class CriticalsCheck extends Check {
             int needed = plugin.config().optInt(CheckType.CRITICALS, "buffer", 3);
             if (data.critsBuffer >= needed) {
                 flag(attacker, data, String.format(Locale.ROOT,
-                        "packet onGround=true while airborne %d ticks (forced crits)",
+                        "packet onGround=true while airborne %.0f ticks (forced crits)",
                         data.airTicks), 3);
                 data.critsBuffer = 0;
             }
@@ -60,10 +67,9 @@ public final class CriticalsCheck extends Check {
             data.critsBuffer = Math.max(0, data.critsBuffer - 1);
         }
 
-        // crit rhythm tracking (PvP hits only)
+        // crit rhythm tracking (PvP hits only). attackAirborne is pushed by the
+        // always-on TelemetryCollector, so f16/AI no longer depend on this check
         if (event.getEntity() instanceof Player) {
-            boolean airborneAtHit = !GroundUtil.isOnGround(attacker);
-            PlayerData.push(data.attackAirborne, airborneAtHit, PlayerData.HIT_CAP);
             checkCritRhythm(attacker, data, now);
         }
     }

@@ -2,8 +2,12 @@ name: WepAC
 version: 1.0.0
 main: dev.weposs.wepac.WepAC
 api-version: '1.21'
+folia-supported: false
 author: wepposs
 description: Self-learning AI anti-cheat for Minecraft servers
+# load order only - nothing here is required at runtime:
+# ViaVersion/ViaBackwards (legacy protocol awareness), floodgate (Bedrock exempt)
+softdepend: [ViaVersion, ViaBackwards, floodgate]
 
 commands:
   wepac:

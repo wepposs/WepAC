@@ -32,8 +32,10 @@ import java.util.UUID;
  * ice boat roads (separate generous cap).
  *
  * Punishment: threshold 3 + severity 5 per confirmed flag + the BOATFLY stage
- * override means an instant tempban on the first confirmed violation - the
- * signal is deterministic, a boat in the sky for 0.3s has no honest explanation.
+ * override means an instant KICK on the first confirmed violation (ban follows
+ * via the record system on recidivism) - the signal is near-deterministic, but
+ * ballistic arcs off ramps are hard to model perfectly and a first-offense ban
+ * is unrecoverable if one slips through.
  */
 public final class BoatFlyCheck extends Check {
 
@@ -55,6 +57,13 @@ public final class BoatFlyCheck extends Check {
         if (passengers.isEmpty()) return;
         if (!(passengers.get(0) instanceof Player player)) return;
         if (player.hasPermission("wepac.bypass")) return;
+        // attribution: with two riders we cannot know who controls (and who
+        // cheats) - only judge single-player boats
+        int riders = 0;
+        for (Entity e : passengers) {
+            if (e instanceof Player) riders++;
+        }
+        if (riders != 1) return;
 
         PlayerData data = plugin.data().get(player);
         Location from = event.getFrom();
@@ -67,12 +76,22 @@ public final class BoatFlyCheck extends Check {
         int[] st = streaks.computeIfAbsent(vehicle.getUniqueId(), k -> new int[3]);
         if (streaks.size() > 1000) streaks.clear(); // safety valve
 
-        // just launched (explosion, collision, drop) - grace
-        if (vehicle.getVelocity().lengthSquared() > 0.12) {
+        // Launch grace. The old threshold (|v|^2 > 0.12, i.e. |v| > 0.35 b/t)
+        // matched NORMAL rowing (~0.3-0.45) and ice roads (1.5+), so the speed
+        // cap was never evaluated exactly when it mattered, and a velocity-driven
+        // boat-fly (KeyzDLC up=0.4) lived inside the grace forever. Ballistic
+        // hover/rise needs |v| > 1.0; only a real launch (|v| > 2.0: explosion,
+        // cannon) excuses the speed caps.
+        double vLen2 = vehicle.getVelocity().lengthSquared();
+        if (vLen2 > 4.0) {
             st[0] = 0;
             st[1] = 0;
             st[2] = 0;
             return;
+        }
+        if (vLen2 > 1.0) {
+            st[0] = 0;
+            st[1] = 0;
         }
 
         Block at = to.getBlock();
@@ -86,8 +105,10 @@ public final class BoatFlyCheck extends Check {
         boolean onGround = belowType.isSolid() && !inWater && !bubble;
         boolean airborne = !inWater && !bubble && !onGround;
 
-        // A) hovering / flying: airborne and NOT falling (gravity always wins)
-        if (airborne && dy > -0.04) {
+        // A) hovering / flying: airborne, NOT falling (gravity always wins) and
+        // nearly stationary horizontally - the apex of a small ballistic arc
+        // still carries horizontal speed, a hover module does not
+        if (airborne && dy > -0.04 && hDist < 0.5) {
             st[0]++;
             if (st[0] >= plugin.config().optInt(CheckType.BOATFLY, "hover-events", 6)) {
                 flag(player, data, String.format(Locale.ROOT,
@@ -98,8 +119,11 @@ public final class BoatFlyCheck extends Check {
             st[0] = Math.max(0, st[0] - 1);
         }
 
-        // B) powered climb outside water (bubble columns legitimately lift boats)
-        if (!inWater && !bubble && dy > 0.05) {
+        // B) powered climb outside water (bubble columns legitimately lift boats).
+        // A9: require LOW horizontal speed too - the apex of a ballistic arc off
+        // an ice ramp has dy > 0.05 for 4+ events at high speed and is a legit
+        // stunt; a hover-climb module rises near-vertically in place.
+        if (!inWater && !bubble && dy > 0.05 && hDist < 0.6) {
             st[1]++;
             if (st[1] >= plugin.config().optInt(CheckType.BOATFLY, "rise-events", 4)) {
                 flag(player, data, String.format(Locale.ROOT,

@@ -9,21 +9,23 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.player.PlayerMoveEvent;
 
-import java.util.ArrayDeque;
 import java.util.Locale;
 
 /**
  * SilentRot: the server-visible signature of "silent" rotations (silent scaffold,
  * silent aura, NoServerRotate companions). The cheat snaps the server-side pitch
- * down to the block/target for one action, then snaps back to the camera angle -
- * producing large, fast pitch REVERSALS that human tracking never sustains.
+ * (or yaw) to the block/target for one action, then snaps back to the camera
+ * angle - producing large, fast REVERSALS that human tracking never sustains.
  *
- * Detection: a reversal = two consecutive pitch deltas of at least {min-swing-deg}
- * in opposite directions within {flip-window-ms}. {min-reversals} of them inside
- * {window-ms} (with a confirmation buffer) is mechanically impossible for a human
- * in normal play.
+ * A15 hardening: reversals are counted only when ACTION-CORRELATED - within
+ * ~250ms after an attack/place/interact (tracked by TelemetryCollector). That is
+ * exactly the silent-rot signature (snap -> act -> snap back), while honest
+ * combat flicks (ground target -> air target) reverse WITHOUT the action
+ * coupling and no longer count. Yaw reversals are covered with the same gate
+ * (horizontal-only silent auras were previously invisible).
  *
- * The reversal timestamps also feed the AI (pitchRevRate feature).
+ * Reversal COLLECTION lives in TelemetryCollector (always on), so the AI
+ * pitchRevRate feature no longer depends on this check being enabled.
  */
 public final class SilentRotCheck extends Check {
 
@@ -37,49 +39,35 @@ public final class SilentRotCheck extends Check {
         if (!enabled() || bypass(player)) return;
 
         PlayerData data = plugin.data().get(player);
-        double dPitch = event.getTo().getPitch() - event.getFrom().getPitch();
         long now = System.currentTimeMillis();
-
-        double minSwing = plugin.config().optDouble(CheckType.SILENTROT, "min-swing-deg", 30.0);
-        long flipWindow = plugin.config().optLongOr(CheckType.SILENTROT, "flip-window-ms", 500L);
-
-        if (Math.abs(dPitch) >= minSwing) {
-            int dir = dPitch > 0 ? 1 : -1;
-            if (data.lastPitchDir != 0 && dir != data.lastPitchDir
-                    && now - data.lastReversalTime <= flipWindow) {
-                data.pitchReversals.addLast(now);
-                data.lastReversalTime = now;
-            } else if (data.lastPitchDir != 0 && dir != data.lastPitchDir) {
-                data.lastReversalTime = now;
-            }
-            data.lastPitchDir = dir;
-        }
-
         long window = plugin.config().optLongOr(CheckType.SILENTROT, "window-ms", 5000L);
-        while (!data.pitchReversals.isEmpty() && now - data.pitchReversals.peekFirst() > window) {
-            data.pitchReversals.pollFirst();
-        }
+        prune(data.actionPitchReversals, now, window);
+        prune(data.actionYawReversals, now, window);
 
+        int reversals = data.actionPitchReversals.size() + data.actionYawReversals.size();
         int minReversals = plugin.config().optInt(CheckType.SILENTROT, "min-reversals", 5);
-        if (data.pitchReversals.size() >= minReversals) {
+        if (reversals >= minReversals) {
             data.silentRotBuffer++;
             int needed = plugin.config().optInt(CheckType.SILENTROT, "buffer", 2);
             if (data.silentRotBuffer >= needed) {
+                double minSwing = plugin.config().optDouble(CheckType.SILENTROT, "min-swing-deg", 30.0);
                 flag(player, data, String.format(Locale.ROOT,
-                        "%d pitch reversals >=%.0f deg in %.1fs (silent rotations)",
-                        data.pitchReversals.size(), minSwing, window / 1000.0), 3);
+                        "%d action-correlated reversals (pitch>=%.0f deg / yaw>=%.0f deg) in %.1fs - silent rotations",
+                        reversals, minSwing,
+                        plugin.config().optDouble(CheckType.SILENTROT, "yaw-min-swing-deg", 60.0),
+                        window / 1000.0), 3);
                 data.silentRotBuffer = 0;
-                data.pitchReversals.clear();
+                data.actionPitchReversals.clear();
+                data.actionYawReversals.clear();
             }
         } else {
             data.silentRotBuffer = Math.max(0, data.silentRotBuffer - 1);
         }
     }
 
-    /** Reversals per second over the rolling window - AI feature 17. */
-    public static double reversalRate(PlayerData data, long windowMs) {
-        ArrayDeque<Long> r = data.pitchReversals;
-        if (r.isEmpty()) return 0.0;
-        return r.size() / (windowMs / 1000.0);
+    private static void prune(java.util.ArrayDeque<Long> deque, long now, long windowMs) {
+        while (!deque.isEmpty() && now - deque.peekFirst() > windowMs) {
+            deque.pollFirst();
+        }
     }
 }

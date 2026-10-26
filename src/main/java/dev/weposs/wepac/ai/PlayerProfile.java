@@ -1,12 +1,9 @@
 package dev.weposs.wepac.ai;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-
 /**
  * Per-player behavioural baseline learned online with Welford's algorithm.
  * Used for z-scores in staff info and as an adaptive sanity reference.
+ * Session-scoped by design: profiles are not persisted (see README roadmap).
  */
 public final class PlayerProfile {
 
@@ -47,27 +44,5 @@ public final class PlayerProfile {
     public double zscore(int i, double value) {
         double sd = stddev(i);
         return sd < 1e-9 ? 0.0 : (value - mean[i]) / sd;
-    }
-
-    public void save(DataOutputStream out) throws IOException {
-        out.writeLong(count);
-        for (int i = 0; i < dims; i++) {
-            out.writeDouble(mean[i]);
-        }
-        for (int i = 0; i < dims; i++) {
-            out.writeDouble(m2[i]);
-        }
-    }
-
-    public static PlayerProfile load(DataInputStream in, int dims) throws IOException {
-        PlayerProfile p = new PlayerProfile(dims);
-        p.count = in.readLong();
-        for (int i = 0; i < dims; i++) {
-            p.mean[i] = in.readDouble();
-        }
-        for (int i = 0; i < dims; i++) {
-            p.m2[i] = in.readDouble();
-        }
-        return p;
     }
 }

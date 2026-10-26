@@ -88,6 +88,24 @@ public final class CombatProfiler implements Listener {
         }
     }
 
+    /**
+     * C9: a donor who logs off right after the fight must not be lost - the
+     * snapshot and the purity gates are all still evaluable while PlayerData
+     * exists (HIGH priority runs before ConnectionListener removes it on MONITOR).
+     */
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onQuit(org.bukkit.event.player.PlayerQuitEvent event) {
+        UUID id = event.getPlayer().getUniqueId();
+        Session s = sessions.remove(id);
+        if (s != null) {
+            try {
+                consider(id, s, System.currentTimeMillis());
+            } catch (Throwable t) {
+                plugin.debug("CombatProfiler quit-evaluation error: " + t);
+            }
+        }
+    }
+
     private void evaluateSessions() {
         ConfigManager cfg = plugin.config();
         if (!cfg.aiEnabled || !cfg.pvpLearningEnabled) {
@@ -95,6 +113,8 @@ public final class CombatProfiler implements Listener {
             return;
         }
         long now = System.currentTimeMillis();
+        // rate-limit map hygiene: drop entries whose window has long passed
+        lastDonation.values().removeIf(t -> now - t > 3_600_000L);
         long timeoutMs = 1000L * cfg.pvpSessionTimeoutSeconds;
         Iterator<Map.Entry<UUID, Session>> it = sessions.entrySet().iterator();
         while (it.hasNext()) {
@@ -123,7 +143,7 @@ public final class CombatProfiler implements Listener {
 
         Player player = Bukkit.getPlayer(id);
         PlayerData data = plugin.data().getIfLoaded(id);
-        if (player == null || data == null) return;
+        if (player == null || data == null) return; // data outlives the quit event at HIGH priority
 
         // triple purity gate
         if (data.totalVl() > 0) return;

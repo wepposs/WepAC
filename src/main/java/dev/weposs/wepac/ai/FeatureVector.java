@@ -42,12 +42,4 @@ public final class FeatureVector {
     public double[] toArray() {
         return values.clone();
     }
-
-    public static FeatureVector copyOf(double[] raw) {
-        FeatureVector v = new FeatureVector();
-        for (int i = 0; i < SIZE && i < raw.length; i++) {
-            v.set(i, raw[i]);
-        }
-        return v;
-    }
 }

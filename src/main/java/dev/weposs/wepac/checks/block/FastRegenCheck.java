@@ -12,8 +12,13 @@ import org.bukkit.event.entity.EntityRegainHealthEvent;
 import java.util.Locale;
 
 /**
- * Natural saturation regen fires at most every ~4s in vanilla.
- * Faster regen events indicate a regen hack; violating events are cancelled.
+ * Natural regen comes in two vanilla branches, both arriving as SATIATED:
+ * food=20 with saturation regenerates 1 HP every 500ms, the unsaturated
+ * branch (food>=18) only every ~4s. Judging both against one 3s floor used
+ * to CANCEL and punish the legitimate regen of every well-fed player.
+ * The saturated/peaceful branch is judged against a 400ms floor instead -
+ * regen hacks run at 50-150ms and are still caught.
+ * Violating events are cancelled so the cheat grants no benefit.
  */
 public final class FastRegenCheck extends Check {
 
@@ -34,7 +39,11 @@ public final class FastRegenCheck extends Check {
 
         PlayerData data = plugin.data().get(player);
         long now = System.currentTimeMillis();
-        long minInterval = plugin.config().optLongOr(CheckType.FASTREGEN, "min-interval-ms", 3000L);
+        boolean fastBranch = reason == EntityRegainHealthEvent.RegainReason.REGEN
+                || (player.getFoodLevel() >= 20 && player.getSaturation() > 0f);
+        long minInterval = fastBranch
+                ? plugin.config().optLongOr(CheckType.FASTREGEN, "min-interval-saturated-ms", 400L)
+                : plugin.config().optLongOr(CheckType.FASTREGEN, "min-interval-ms", 3000L);
         long last = data.lastRegenTime;
         data.lastRegenTime = now;
         if (last == 0L) return;

@@ -48,6 +48,7 @@ public final class Compat {
         return enchantLevel(item, keyNames) > 0;
     }
 
+    @SuppressWarnings("deprecation") // getName() is the deliberate pre-1.20.5 fallback
     private static String enchantKey(Enchantment en) {
         try {
             return en.getKey().getKey();
@@ -81,6 +82,7 @@ public final class Compat {
         return -1;
     }
 
+    @SuppressWarnings("deprecation") // getName() is the deliberate pre-1.20.5 fallback
     private static String effectKey(PotionEffectType t) {
         if (t == null) return "";
         try {

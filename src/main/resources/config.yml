@@ -8,9 +8,25 @@ prefix: "&8[&cWepAC&8]&r "
 # Staff alerts
 alerts:
   # Message sent to staff with wepac.alerts when a check triggers
-  format: "{prefix}&7{player} &8| &c{check} &8| &7VL {vl} &8| &7ping {ping}ms &8| &7AI {ai} &8| &f{info}"
+  # Placeholders: {prefix} {player} {check} {vl} {ping} {ai} {info} {world} {x} {y} {z}
+  format: "{prefix}&7{player} &8| &c{check} &8| &7VL {vl} &8| &7ping {ping}ms &8| &7AI {ai} &8| &f{info} &8[{world} {x} {y} {z}]"
   # Also broadcast to console
   console: true
+  # Minimum ms between chat messages for the SAME player+check (anti alert-storm:
+  # Reach flags on every hit). VL bookkeeping and punishments still run at full
+  # speed - only the message is throttled. 0 disables throttling.
+  cooldown-ms: 1000
+
+# ------------------------------------------------------------
+#  CROSS-SESSION VL PERSISTENCE
+#  Without it a cheater at VL 24/25 just reconnects and starts from zero.
+#  VL + fired punishment stages are saved on quit, restored on join, and
+#  expire after N days (VL decay only runs while online).
+# ------------------------------------------------------------
+vl-persistence:
+  enabled: true
+  file: vl.yml
+  expire-days: 7
 
 # Violation (VL) decay: removes {amount} VL every {interval} seconds of clean play
 decay:
@@ -42,13 +58,22 @@ punishments:
       command: "kick %player% &c[WepAC] Unfair advantage detected (%check%)"
     - at: 50
       command: "tempban %player% 1d &c[WepAC] %check%"
-  # Per-check overrides. BoatFly is deterministic physics (a boat cannot hover),
-  # so it punishes instantly on the first confirmed flag (threshold 3 + severity 5
-  # per flag passes the confirm gate at once).
+  # Per-check overrides.
   overrides:
+    # BoatFly is deterministic physics (a boat cannot hover), so it punishes on
+    # the first confirmed flag - but with a KICK, not a tempban: ballistic arcs
+    # off ice ramps are hard to model perfectly, and a ban for a first offense
+    # is unrecoverable if one slips through. Recidivists get auto-banned by the
+    # record system (strike -> WATCH -> review -> WANTED).
     BOATFLY:
       - at: 3
-        command: "tempban %player% 1d &c[WepAC] BoatFly — лодка не умеет летать"
+        command: "kick %player% &c[WepAC] BoatFly — лодка не умеет летать"
+    # Xray is a STATISTIC: large open caves, deep dark, ore datapacks and plain
+    # luck all produce legit ratio spikes. Alerts + staff review only, never an
+    # automated kick/ban (the stage below is unreachable in practice).
+    XRAY:
+      - at: 99999999
+        command: ""
 
 # ------------------------------------------------------------
 #  KICK/BAN CONFIRMATION - the anti-cheat only kicks when CONVINCED.
@@ -63,6 +88,17 @@ confirm:
   min-distinct-checks: 2
   single-check-vl-multiplier: 1.5
   ai-probability: 0.97
+  # Commands whose FIRST WORD is on this list execute without confirmation.
+  # EVERYTHING ELSE (kick/ban/tempban and any custom alias like "vban" or
+  # "sanction") is treated as harsh and gated - unknown verbs fail safe.
+  safe-commands:
+    - broadcast
+    - say
+    - warn
+    - msg
+    - tell
+    - title
+    - me
 
 # ------------------------------------------------------------
 #  POLICE RECORD ("учёт")
@@ -76,27 +112,43 @@ confirm:
 record:
   enabled: true
   file: records.yml
+  # WATCH auto-downgrades to CLEAN after this many days without a new strike
+  # (one false kick must not mean stricter thresholds forever). 0 = never.
+  # WANTED never expires automatically - clear it with /ac record <p> clear.
+  expire-days: 30
   watch-threshold-multiplier: 0.6
   wanted-threshold-multiplier: 0.4
   review-ban-score: 100
   ban-command: "tempban %player% 7d &c[WepAC] Рецидив после учёта (%check%, score %score%)"
   # What the anti-cheat screams into the staff console when the verdict is clear.
-  rage-message: "&4&l%player%&c&l, ЧИТАК ЕБУЧИЙ СУКА БАНЬТЕ БЛЯТЬ БЫСТРЕЕ НАХУЙ"
+  rage-message: "&4&l%player% &c&l— В РОЗЫСКЕ: подтверждённый читер. Баньте немедленно, вердикт окончательный."
   rage-repeat: 3
 
 # ------------------------------------------------------------
 #  CLIENT DETECTION
 #  On join every client announces itself via the "minecraft:brand" payload.
-#   - brand matches cheat-brands      -> 100% certainty, BAN + rage alert
+#  The brand is SELF-REPORTED: a cheat can claim "vanilla" and slip past this
+#  detector (behavioural checks still apply), but no legit client carries a
+#  cheat's brand - so a positive match is a sound ban trigger.
+#   - brand matches cheat-brands      -> maximum watch + loud staff alert;
+#                                        BAN only if ban-on-brand is enabled
 #   - brand suspicious/unknown        -> NOT banned (could be a rare vanilla
 #                                        launcher), put ON RECORD and watched
 #   - brand matches known-brands      -> reported to staff ("plays from ...")
+#  Matching is collision-safe: needles >= 8 chars match as substrings,
+#  6-7 chars as token prefixes, <= 5 chars as exact whole tokens
+#  ("GhostlyCraft" modpack is NOT the "ghost" cheat).
+#  Players with wepac.bypass are never acted upon (brand is recorded only).
 # ------------------------------------------------------------
 client-detect:
   enabled: true
   notify-staff: true
+  # Ban purely on a self-reported brand match. Default OFF: a match puts the
+  # player on maximum watch + a loud staff alert instead, because brands can
+  # collide with modpack names. Enable once you trust the list for your audience.
+  ban-on-brand: false
   ban-command: "ban %player% &c[WepAC] Читерский клиент: %client%"
-  # Definitive cheat clients (substring match on the lowercased brand)
+  # Definitive cheat clients (match rules above, on the lowercased brand)
   cheat-brands:
     # --- verified from client sources/JARs (fabric.mod.json ids, 10-agent sweep) ---
     - catlean
@@ -137,18 +189,17 @@ client-detect:
     - vzmax
     - govno
     # --- from the loader/launcher collection ---
+    # NOTE: generic english words (ghost, wave, delta, energy, peak, solar,
+    # expensive) were MOVED to watch-brands: they can legitimately appear in
+    # modpack brands, and a watch is recoverable while a ban is not.
     - rockstar
     - nursultan
-    - ghost
     - onyx
     - aether
     - xeno
-    - delta
-    - expensive
     - evolate
     - everlast
     - eternity
-    - energy
     - nuclear
     - nexis
     - valhalla
@@ -160,9 +211,6 @@ client-detect:
     - akrien
     - sadnes
     - polyak
-    - peak
-    - solar
-    - wave
     - quickfree
     - zamorozka
     - restance
@@ -189,6 +237,15 @@ client-detect:
   watch-brands:
     - salwyrr
     - modded
+    # generic-word cheat brands moved here from cheat-brands (see note above):
+    # a "Delta Crafts" modpack must not be auto-punished, but is worth watching
+    - ghost
+    - wave
+    - delta
+    - energy
+    - peak
+    - solar
+    - expensive
   # NOTE: intentionally NOT banned by substring: bare "light" (collides with
   # "flight"), bare "quick"/"beta" (too generic). Add manually if you see them.
   # Known legit clients: substring -> display name for staff messages
@@ -216,9 +273,9 @@ client-detect:
 # ------------------------------------------------------------
 packet-sniffer:
   enabled: true
-  # vanilla sends exactly ~20 move packets per second; 21+ sustained = timer
-  # (catches even subtle 1.05-1.1x timers like CatLean's 1.088)
-  timer-max-rate: 21
+  # vanilla sends exactly ~20 move packets per second. 20.5 sustained catches
+  # even subtle 1.05x timers (an integer cap of 21 lets exactly 1.05x through)
+  timer-max-rate: 20.5
   # how long the rate must stay above max before a Timer flag
   timer-sustain-ms: 2500
   # no move packets for this long while online = Blink
@@ -254,9 +311,12 @@ ai:
   alert-threshold: 0.90
   # AI adjusts per-player check sensitivity (thresholds shrink for suspicious players)
   adaptive-thresholds: true
-  # multiplier = clamp(high - (high-low)*probability, low, high)
+  # multiplier = clamp(high - (high-low)*probability, low, high), applied to the
+  # EMA-smoothed probability. The relaxation cap is deliberately modest (1.15):
+  # an "unknown" player must not get a big benefit of the doubt - that just
+  # hands the first subtle cheat +15% headroom.
   adaptive-min-multiplier: 0.65
-  adaptive-max-multiplier: 1.30
+  adaptive-max-multiplier: 1.15
   # EXPERIMENTAL: let AI alone trigger punishments at very high probability.
   # Keep false until the model has trained on your server.
   punish-by-ai: false
@@ -279,16 +339,18 @@ ai:
 
 # ------------------------------------------------------------
 #  CHECKS
-#  threshold = VL needed before punishment stages apply
+#  threshold = VL needed before punishment stages apply.
+#  Every check also accepts:
+#    disabled-worlds: [world_n]   - off in listed worlds (minigames/parkour)
+#    exempt-creative: true|false  - creative players bypass (default true)
 # ------------------------------------------------------------
 checks:
   fly:
     enabled: true
     threshold: 20
-    # Ticks airborne while NOT losing altitude (hovering/rising)
+    # Game ticks airborne while NOT losing altitude before a flag. Note the
+    # code flags at 2x this value (confirmation headroom), so 8 -> flag at 16.
     max-hover-ticks: 8
-    # Flag client "on ground" while no solid block below (ground spoof)
-    detect-ground-spoof: true
     # Physics simulation: accumulated blocks of "extra height" vs gravity
     # simulation before flagging (catches glide/slow-fall/gradual-climb fly)
     physics-divergence: 0.75
@@ -312,6 +374,9 @@ checks:
     enabled: true
     threshold: 15
     multiplier: 1.6
+    # consecutive over-limit samples (4Hz) before a flag - one noisy window
+    # seam or a ladder->roof transition must not VL instantly
+    buffer: 3
   wallclimb:
     enabled: true
     threshold: 12
@@ -342,9 +407,11 @@ checks:
     enabled: true
     threshold: 20
     # 1.9+ reality: damage is gated by the attack cooldown, and legit
-    # butterfly/drag clickers reach 20+ CPS. The CPS cap only catches
-    # impossible spam; the real signal is robotic interval consistency.
-    max-cps: 25
+    # butterfly/drag clickers reach 20+ CPS in short bursts. The CPS cap only
+    # catches sustained impossible spam (2 consecutive windows); the real
+    # signal is robotic interval consistency.
+    max-cps: 28
+    cps-buffer: 2
     # Robotic consistency: std deviation of click intervals below this (ms)
     # over at least {min-samples} clicks -> flag
     min-interval-stddev: 12.0
@@ -352,8 +419,11 @@ checks:
   killaura:
     enabled: true
     threshold: 18
-    # A. Max attacks per rolling second
+    # A. Max attacks per rolling second. Only attacks with cooldown charge >=
+    #    rate-min-charge count: on 1.9+ weak pre-cooldown hits also fire damage
+    #    events, and raw event rate would punish legit jitter clicking (15-20 CPS)
     max-attacks-per-second: 14
+    rate-min-charge: 0.4
     # B. Max angle (degrees) between look direction and a PLAYER victim
     max-rotation-angle: 75.0
     # C. Snap-aim: whole rotation onto the victim within one packet burst
@@ -418,14 +488,19 @@ checks:
   scaffold:
     enabled: true
     threshold: 15
-    # Flag placing blocks below feet while looking forward (pitch below this)
-    max-pitch: 25.0
+    # Flag placing blocks below feet while looking forward (pitch below this).
+    # NOTE: god-bridge produces the same signature - flags are severity 1
+    # (informational) and escalate only via sustained VL / cross-checks.
+    max-pitch: 20.0
     buffer: 4
   fastregen:
     enabled: true
     threshold: 10
-    # Minimum ms between natural saturation regen events
+    # Minimum ms between natural regen events WITHOUT saturation.
+    # Vanilla saturated regen (food 20 + saturation) fires every 500ms and is
+    # judged against min-interval-saturated-ms instead; hack signature is 50-150ms.
     min-interval-ms: 3000
+    min-interval-saturated-ms: 400
   fasteat:
     enabled: true
     threshold: 10
@@ -464,8 +539,10 @@ checks:
     ice-speed-cap: 1.8
     water-speed-cap: 0.55
     land-speed-cap: 0.35
-    # Consecutive VehicleMoveEvents before each signal flags
-    hover-events: 6
+    # Consecutive VehicleMoveEvents before each signal flags.
+    # hover: 8 (was 6) - the apex of a small ramp arc can mimic hovering for a
+    # few events even with the hDist<0.5 gate
+    hover-events: 8
     rise-events: 4
     speed-events: 8
   noweb:
@@ -480,7 +557,12 @@ checks:
     threshold: 12
     # Camera rotation while a GUI is open is impossible in vanilla
     min-rotation: 2.0
-    buffer: 5
+    buffer: 6
+    # The player's OWN inventory (E) fires no InventoryOpenEvent, so clicks on
+    # it open a short observation window instead (mouse is captured the same).
+    # Self-inv flags are informational (severity 1): an honest quick
+    # click -> close -> flick can rarely land inside the window.
+    self-inv-window-ms: 250
   cheststealer:
     enabled: true
     threshold: 12
@@ -508,6 +590,15 @@ checks:
   badpackets:
     enabled: true
     threshold: 5
+  packetfly:
+    enabled: true
+    threshold: 16
+    # Per-packet gravity simulation (20 Hz, fed by the netty sniffer):
+    # every move packet's dy must match vy = (vy - 0.08) * 0.98 physics.
+    # Accumulated blocks of "extra height" before an overflow event:
+    divergence-limit: 0.35
+    # Overflow events within a 3s window needed to confirm a flag
+    buffer: 2
   criticals:
     enabled: true
     threshold: 12
@@ -533,10 +624,13 @@ checks:
     # to the camera angle - large fast reversals no human tracking sustains.
     # Thresholds are deliberately high: legit players DO flick up/down in fights,
     # so we require several LARGE reversals in a short window before flagging.
-    min-swing-deg: 30.0     # magnitude of each side of a reversal
+    min-swing-deg: 30.0     # magnitude of each side of a pitch reversal
+    yaw-min-swing-deg: 60.0 # same for yaw (silent horizontal rotations)
     flip-window-ms: 500     # max time between the two sides of one reversal
     window-ms: 5000         # rolling window to count reversals in
-    min-reversals: 5
+    min-reversals: 5        # ACTION-correlated reversals (within ~250ms after
+                            # attack/place/interact) - honest combat flicks are
+                            # not coupled to actions and do not count
     buffer: 2
   xray:
     enabled: true

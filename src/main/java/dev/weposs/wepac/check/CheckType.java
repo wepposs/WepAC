@@ -25,6 +25,7 @@ public enum CheckType {
     TIMER("Timer", Category.PACKET),
     BLINK("Blink", Category.PACKET),
     BADPACKETS("BadPackets", Category.PACKET),
+    PACKETFLY("PacketFly", Category.PACKET),
     REACH("Reach", Category.COMBAT),
     AUTOCLICKER("AutoClicker", Category.COMBAT),
     KILLAURA("KillAura", Category.COMBAT),
