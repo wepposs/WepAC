@@ -44,6 +44,34 @@ public final class Compat {
         return 0;
     }
 
+    /** 1.21.11 spears (extended attack range, piercing jab, Lunge impulse). */
+    public static boolean isSpear(ItemStack item) {
+        return item != null && item.getType().name().endsWith("_SPEAR");
+    }
+
+    public static boolean holdingSpear(Player player) {
+        return isSpear(player.getInventory().getItemInMainHand())
+                || isSpear(player.getInventory().getItemInOffHand());
+    }
+
+    public static final String[] LUNGE = {"lunge"};
+
+    /**
+     * Value of a player attribute by registry key (1.20.5+), or {@code def}
+     * when the attribute does not exist on this build.
+     */
+    public static double attribute(Player player, String key, double def) {
+        try {
+            org.bukkit.attribute.Attribute a = org.bukkit.Registry.ATTRIBUTE.get(
+                    org.bukkit.NamespacedKey.minecraft(key));
+            if (a == null) return def;
+            org.bukkit.attribute.AttributeInstance inst = player.getAttribute(a);
+            return inst == null ? def : inst.getValue();
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
     public static boolean hasEnchant(ItemStack item, String... keyNames) {
         return enchantLevel(item, keyNames) > 0;
     }

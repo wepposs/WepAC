@@ -273,6 +273,10 @@ client-detect:
 # ------------------------------------------------------------
 packet-sniffer:
   enabled: true
+  # Transaction engine: a Ping packet every tick, Pong order verified.
+  # Anchors Reach lag compensation, detects fakelag/backtrack (withheld acks),
+  # reordered/fabricated pongs (disablers) and keep-alive ping spoofing.
+  transactions: true
   # vanilla sends exactly ~20 move packets per second. 20.5 sustained catches
   # even subtle 1.05x timers (an integer cap of 21 lets exactly 1.05x through)
   timer-max-rate: 20.5
@@ -360,6 +364,14 @@ checks:
     # Max allowed = vanilla_limit * multiplier (vanilla sprint-jump ~0.29 b/tick)
     multiplier: 1.45
     buffer: 8
+    # Per-packet horizontal prediction (20 Hz): every move packet is bounded by
+    # the max vanilla acceleration/friction equation (full input, sprint assumed,
+    # Speed effect, ice/slime slipperiness). Excess accumulates; flag on overflow.
+    packet-sim: true
+    packet-sim-limit: 0.25
+    packet-sim-buffer: 2
+    # Raise for servers with custom speed attributes/enchants
+    packet-sim-multiplier: 1.0
   jesus:
     enabled: true
     threshold: 15
@@ -385,6 +397,11 @@ checks:
     # Height climbed above the wall-contact point before flagging.
     # A vanilla jump along a wall rises at most ~1.25 blocks.
     min-climb-height: 1.3
+    # Net-height Spider: height gained above the last support (ground, ladder,
+    # liquid, elytra...) while touching a wall may not exceed one vanilla jump
+    # (1.25 b, Jump Boost aware) + this margin. Catches pulsed / stepped /
+    # jump-spider modes that defeat per-sample rise streaks.
+    net-margin: 0.2
   airjump:
     enabled: true
     threshold: 12
@@ -403,6 +420,15 @@ checks:
     # Add ping/1000 * compensation blocks (capped)
     ping-compensation: 0.35
     max-ping-compensation: 0.6
+    # 1.21.11 spears (attack_range component): jab reach limit while a spear
+    # is in the main hand. The entity_interaction_range attribute is honoured
+    # automatically (custom attribute servers need no tuning).
+    spear-max-reach: 4.55
+    # Statistical layer: average lag-compensated distance over the last N hits.
+    # Catches "smart" 3.1-3.3 reach that hides under the per-hit allowance.
+    avg-samples: 12
+    avg-max-reach: 2.95
+    avg-max-ping: 250
   autoclicker:
     enabled: true
     threshold: 20
@@ -448,6 +474,23 @@ checks:
     multi-max-targets: 4
     multi-window-ms: 1500
     multi-max-angle: 40.0
+    # K. Hitbox (deterministic): the attack ray - rotation before/after the hit
+    #    and the frames between - must intersect the victim's hitbox at one of
+    #    the lag-compensated positions. Silent/rotation-less auras fail it.
+    hitbox-expand: 0.1
+    hitbox-buffer: 8          # +3 per miss, -1 per clean hit
+    # N. HitThroughWalls: the entity hit must come before any block outline on
+    #    the attack ray (vanilla picking). +3 per walled hit, -1 per clean hit.
+    walls-buffer: 6
+    # after a confirmed flag, cancel line-of-sight-blocked hits for 3s
+    walls-cancel: true
+    # L. Triggerbot: crosshair-entry -> attack reaction in the attacker's frame
+    triggerbot: true
+    triggerbot-max-ms: 75
+    triggerbot-ratio: 0.75    # of the last 12 "waiting" entries
+    # M. AimAssist: crosshair pulled by a constant fraction of the aim error
+    aim-assist: true
+    aim-assist-max-cv: 0.18
     # I. PerfectHits: aim-gated auras (vesence "Shard" etc.) attack only when the
     #    crosshair settled on the target, so nearly every PvP hit lands within
     #    ~1-2 degrees. Humans time clicks, their hit-angle spread is much wider.
@@ -493,6 +536,11 @@ checks:
     # (informational) and escalate only via sustained VL / cross-checks.
     max-pitch: 20.0
     buffer: 4
+    # Impossible-face: block placed against a face whose plane is behind the
+    # player's eye (no line of sight in vanilla). Catches airplace/scaffold.
+    face-check: true
+    face-tolerance: 0.35
+    face-buffer: 2
   fastregen:
     enabled: true
     threshold: 10
@@ -515,6 +563,9 @@ checks:
   noslow:
     enabled: true
     threshold: 15
+    # Per-packet: while an item is in use the horizontal bound uses 0.2x input
+    # and no sprint-jump boost (vanilla item-use slowdown)
+    packet-sim: true
     # Vanilla slows to ~20% speed while using items (~0.05 b/t)
     max-speed: 0.12
     buffer: 6
@@ -545,6 +596,15 @@ checks:
     hover-events: 8
     rise-events: 4
     speed-events: 8
+    # Per-packet boat physics (every vehicle-move packet, 20 Hz). Airborne
+    # boats must follow vy -= 0.04/tick and vh <= vh*0.9 + 0.04 (paddle).
+    # Catches hover, glide/slow-fall, climb, forward-fly velocity modes.
+    packet-sim: true
+    sim-vertical-limit: 0.5
+    sim-horizontal-limit: 0.8
+    sim-buffer: 2
+    # On a confirmed flag: dismount and return boat+rider to the last support
+    setback: true
   noweb:
     enabled: true
     threshold: 12
@@ -584,12 +644,21 @@ checks:
   timer:
     enabled: true
     threshold: 8
+    # Balance timer: +50ms per client tick, minus real elapsed time; lag can
+    # be caught up (floor -1500ms) but never banked. Flags when the client is
+    # this far AHEAD of real time - catches 1.02x timers and burst-timers.
+    balance-limit-ms: 300
   blink:
     enabled: true
     threshold: 8
+    # Transaction engine: flag when pongs are withheld this long while the
+    # client keeps sending movement (fakelag / backtrack)
+    transaction-hold-ms: 2500
   badpackets:
     enabled: true
     threshold: 5
+    # keep-alive ping exceeding transaction RTT by this much (and 2x), 30s sustained
+    ping-spoof-gap: 250.0
   packetfly:
     enabled: true
     threshold: 16
@@ -616,6 +685,11 @@ checks:
     # after a significant hit the player must travel at least this fraction
     # of the expected knockback distance
     absorb-ratio: 0.35
+    # Transaction-confirmed knockback (needs packet-sniffer.transactions):
+    # first move after the client acked the velocity must travel at least
+    # kb * tx-ratio - 0.13 (max counter-input) blocks horizontally
+    tx-ratio: 0.5
+    tx-buffer: 2
     buffer: 2
   silentrot:
     enabled: true

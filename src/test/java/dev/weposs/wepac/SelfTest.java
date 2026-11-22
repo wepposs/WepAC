@@ -4,6 +4,9 @@ import dev.weposs.wepac.ai.NeuralNetwork;
 import dev.weposs.wepac.client.ClientDetector;
 import dev.weposs.wepac.data.PlayerData;
 import dev.weposs.wepac.packet.PacketPhysics;
+import dev.weposs.wepac.packet.HorizontalSim;
+import dev.weposs.wepac.packet.TransactionState;
+import dev.weposs.wepac.packet.VehicleSim;
 import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
@@ -596,5 +599,172 @@ public class SelfTest {
         assertEquals("stddev of one element", 0.0, PlayerData.stddev(new double[]{5}), 1e-12);
         assertEquals("stddev of constants (robotic pacing)", 0.0,
                 PlayerData.stddev(new double[]{7, 7, 7}), 1e-12);
+    }
+
+    // ------------------------------------------------------------------
+    // HorizontalSim + TransactionState
+    // ------------------------------------------------------------------
+
+    /** Runs a vanilla-exact horizontal trajectory scaled by cheatMul; returns total overflow. */
+    private static double runHorizontal(double slip, boolean bhop, double cheatMul, int ticks) {
+        HorizontalSim hs = new HorizontalSim();
+        double speed = 0.13;
+        double x = 0, v = 0;
+        long t = 0;
+        double total = 0;
+        hs.onPacket(x, 0, t, speed, slip, true, false, 0.25);
+        int airLeft = 0;
+        for (int i = 0; i < ticks; i++) {
+            boolean ground = airLeft == 0;
+            boolean jump = bhop && ground;
+            double fr = ground ? slip * 0.91 : 0.91;
+            v += ground ? HorizontalSim.groundAccel(speed, slip) : 0.026;
+            if (jump) {
+                v += HorizontalSim.JUMP_BOOST;
+                airLeft = 11;
+            } else if (airLeft > 0) {
+                airLeft--;
+            }
+            x += v * cheatMul;
+            t += 50;
+            total += hs.onPacket(x, 0, t, speed, ground ? slip : 0.6, ground, jump, 0.25);
+            v *= fr;
+        }
+        return total;
+    }
+
+    @Test
+    public void horizontalVanillaNeverFlags() {
+        assertEquals("ground sprint", 0.0, runHorizontal(0.6, false, 1.0, 400), 1e-12);
+        assertEquals("sprint bhop", 0.0, runHorizontal(0.6, true, 1.0, 400), 1e-12);
+        assertEquals("ice bhop", 0.0, runHorizontal(0.98, true, 1.0, 400), 1e-12);
+        assertEquals("blue ice bhop", 0.0, runHorizontal(0.989, true, 1.0, 400), 1e-12);
+    }
+
+    @Test
+    public void horizontalSpeedCheatFlags() {
+        assertTrue("1.25x ground speed must flag", runHorizontal(0.6, false, 1.25, 200) > 0);
+        assertTrue("1.2x bhop must flag", runHorizontal(0.6, true, 1.2, 200) > 0);
+    }
+
+    @Test
+    public void horizontalBurstAndGapDoNotFlag() {
+        HorizontalSim hs = new HorizontalSim();
+        hs.onPacket(0, 0, 0, 0.13, 0.6, true, false, 0.25);
+        hs.onPacket(0.28, 0, 50, 0.13, 0.6, true, false, 0.25);
+        // lag burst: 5 ticks of movement arriving within 5ms
+        double x = 0.28, over = 0;
+        for (int i = 1; i <= 5; i++) {
+            x += 0.28;
+            over += hs.onPacket(x, 0, 50 + i, 0.13, 0.6, true, false, 0.25);
+        }
+        // long gap with catch-up distance
+        x += 3.0;
+        over += hs.onPacket(x, 0, 700, 0.13, 0.6, true, false, 0.25);
+        assertEquals("burst/gap must re-anchor", 0.0, over, 1e-12);
+    }
+
+    @Test
+    public void transactionsOrderAndRtt() {
+        TransactionState tx = new TransactionState();
+        int a = tx.onSend(1000), b = tx.onSend(1050), c = tx.onSend(1100);
+        assertTrue("ids are negative", TransactionState.ours(a) && !TransactionState.ours(5));
+        assertEquals(TransactionState.PongResult.OK, tx.onPong(a, 1080));
+        assertEquals("rtt", 80.0, tx.rttMs, 1e-9);
+        assertEquals("acked send time", 1000L, tx.lastAckedSendMs);
+        assertEquals("skipping b is out of order", TransactionState.PongResult.OUT_OF_ORDER, tx.onPong(c, 1200));
+        assertEquals("b was consumed by the skip", TransactionState.PongResult.UNKNOWN_ID, tx.onPong(b, 1210));
+        assertEquals("fabricated id", TransactionState.PongResult.UNKNOWN_ID, tx.onPong(-999, 1220));
+        int d = tx.onSend(2000);
+        assertEquals("pending age", 500L, tx.oldestPendingAge(2500));
+        assertEquals(TransactionState.PongResult.OK, tx.onPong(d, 2100));
+        assertEquals(0L, tx.oldestPendingAge(2600));
+    }
+
+    @Test
+    public void transactionsEvictedPongIsStaleNotFabricated() {
+        TransactionState tx = new TransactionState();
+        int first = tx.onSend(0);
+        for (int i = 0; i < TransactionState.MAX_PENDING + 5; i++) tx.onSend(i);
+        assertEquals("late pong for an evicted ping is STALE",
+                TransactionState.PongResult.STALE, tx.onPong(first, 99999));
+        assertEquals("never-sent id is still UNKNOWN",
+                TransactionState.PongResult.UNKNOWN_ID, tx.onPong(-1_000_000, 99999));
+    }
+
+    // ------------------------------------------------------------------
+    // VehicleSim (boat)
+    // ------------------------------------------------------------------
+
+    /** Boat leaves support at (vy0, vh0) with full paddle; cheat adds lift/extra speed per tick. */
+    private static int runBoat(double vy0, double vh0, double lift, double extraH, int ticks) {
+        VehicleSim vs = new VehicleSim();
+        double x = 0, y = 70, vy = vy0, vh = vh0;
+        long t = 0;
+        vs.onPacket(x, y, 0, t, false, 0.5, 0.8);
+        int flags = 0;
+        for (int i = 0; i < ticks; i++) {
+            vy = vy - VehicleSim.GRAVITY + lift;
+            vh = vh * VehicleSim.AIR_FRICTION + VehicleSim.PADDLE + extraH;
+            x += vh;
+            y += vy;
+            t += 50;
+            if (vs.onPacket(x, y, 0, t, true, 0.5, 0.8) != 0) flags++;
+        }
+        return flags;
+    }
+
+    @Test
+    public void boatVanillaArcsNeverFlag() {
+        assertEquals("ice ramp launch", 0, runBoat(0.3, 2.0, 0, 0, 60));
+        assertEquals("walk-off drop", 0, runBoat(0.0, 0.4, 0, 0, 60));
+        assertEquals("bubble column launch", 0, runBoat(0.7, 0.1, 0, 0, 60));
+    }
+
+    @Test
+    public void boatFlyModesFlag() {
+        assertTrue("hover (lift cancels gravity)", runBoat(0.0, 0.0, 0.04, 0, 40) > 0);
+        assertTrue("slow-fall glide (-0.05 b/t)", runBoat(0.0, 0.34, 0.035, 0, 60) > 0);
+        assertTrue("forward fly side=0.6 up=0.4", runBoat(0.4, 0.6, 0.04, 0.06, 40) > 0);
+        assertTrue("subtle climb", runBoat(0.0, 0.3, 0.05, 0, 60) > 0);
+    }
+
+    @Test
+    public void boatTakeoffLaunchCapped() {
+        VehicleSim vs = new VehicleSim();
+        vs.onPacket(0, 70, 0, 0, false, 0.5, 0.8);
+        vs.onPacket(0, 70, 0, 50, false, 0.5, 0.8);
+        assertEquals("3-block boat jump off flat support", 1, vs.onPacket(0, 73, 0, 100, true, 0.5, 0.8));
+    }
+
+    @Test
+    public void horizontalNoSlow() {
+        // vanilla eating walk: input 0.2x, no sprint
+        HorizontalSim hs = new HorizontalSim();
+        hs.inputScale = 0.2;
+        double x = 0, v = 0, total = 0;
+        long t = 0;
+        hs.onPacket(0, 0, 0, 0.13, 0.6, true, false, 0.25);
+        for (int i = 0; i < 200; i++) {
+            v += HorizontalSim.groundAccel(0.1, 0.6) * 0.2;
+            x += v;
+            t += 50;
+            total += hs.onPacket(x, 0, t, 0.13, 0.6, true, false, 0.25);
+            v *= 0.6 * 0.91;
+        }
+        assertEquals("vanilla item-use walk", 0.0, total, 1e-12);
+        // NoSlow cheat: full sprint speed while eating
+        HorizontalSim cheat = new HorizontalSim();
+        cheat.inputScale = 0.2;
+        x = 0; v = 0; total = 0; t = 0;
+        cheat.onPacket(0, 0, 0, 0.13, 0.6, true, false, 0.25);
+        for (int i = 0; i < 100; i++) {
+            v += HorizontalSim.groundAccel(0.13, 0.6);
+            x += v;
+            t += 50;
+            total += cheat.onPacket(x, 0, t, 0.13, 0.6, true, false, 0.25);
+            v *= 0.6 * 0.91;
+        }
+        assertTrue("NoSlow must flag", total > 0);
     }
 }

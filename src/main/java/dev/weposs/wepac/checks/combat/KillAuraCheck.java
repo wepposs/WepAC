@@ -51,7 +51,7 @@ public final class KillAuraCheck extends Check {
      * perfect-hits patterns - only yields an informational severity-1 VL, so
      * single FP episodes no longer sum up towards the kick threshold.
      */
-    private void suspect(Player player, PlayerData data, String detector,
+    public void suspect(Player player, PlayerData data, String detector,
                          String info, int severity) {
         long now = System.currentTimeMillis();
         data.auraVotes.put(detector, now);
