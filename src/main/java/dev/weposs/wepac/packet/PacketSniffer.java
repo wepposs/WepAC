@@ -61,6 +61,17 @@ public final class PacketSniffer {
         channels.clear();
     }
 
+    private TransactionManager transactions;
+
+    public void transactions(TransactionManager tm) {
+        this.transactions = tm;
+    }
+
+    /** Netty channel of a player (null when not injected). */
+    public Channel channel(UUID uuid) {
+        return channels.get(uuid);
+    }
+
     public void inject(Player player) {
         if (!available) return;
         try {
@@ -146,6 +157,26 @@ public final class PacketSniffer {
         // Class#getSimpleName() of a nested class drops the outer name ("Pos",
         // "PacketPlayInPosition"), so we MUST match on the full binary name.
         String cls = msg.getClass().getName();
+        if (transactions != null && (cls.contains("ServerboundPongPacket")
+                || cls.contains("PacketPlayInPong"))) {
+            PlayerData pd = plugin.data().getIfLoaded(uuid);
+            Integer id = readIntField(msg, "id", "a");
+            if (pd != null && id != null) transactions.onPong(pd, id);
+            return;
+        }
+        if (cls.contains("ServerboundMoveVehiclePacket") || cls.contains("PacketPlayInVehicleMove")) {
+            PlayerData vd = plugin.data().getIfLoaded(uuid);
+            double[] xyz = readVehiclePos(msg);
+            if (vd != null && xyz != null) {
+                vd.vehicleMoves.offer(new double[]{System.currentTimeMillis(), xyz[0], xyz[1], xyz[2]});
+            } else if (xyz == null && !vehicleWarned) {
+                vehicleWarned = true;
+                plugin.getLogger().warning("Could not read vehicle move packet " + cls
+                        + " - packet BoatFly simulation INACTIVE on this build.");
+            }
+            return;
+        }
+        if (packetOrder(uuid, cls, msg)) return;
         boolean flying = cls.contains("PacketPlayInFlying")
                 || cls.contains("ServerboundMovePlayerPacket");
         if (!flying) return;
@@ -212,8 +243,13 @@ public final class PacketSniffer {
         }
         // feed the per-packet physics simulation (bounded queue; when the main
         // thread stalls the offer silently drops - Sim resyncs on time gaps)
+        double kbH = data.kbArmedH, kbY = 0.0;
+        if (!Double.isNaN(kbH)) {
+            kbY = data.kbArmedY;
+            data.kbArmedH = Double.NaN; // consumed by the first post-ack move
+        }
         data.packetMoves.offer(new double[]{now, x, y, z,
-                Boolean.TRUE.equals(ground) ? 1.0 : 0.0});
+                Boolean.TRUE.equals(ground) ? 1.0 : 0.0, kbH, kbY});
         double px = data.lastPacketX, py = data.lastPacketY, pz = data.lastPacketZ;
         data.lastPacketX = x;
         data.lastPacketY = y;
@@ -240,6 +276,160 @@ public final class PacketSniffer {
                     data.lastBlinkResumeDist = dist;
                 }
             }
+        }
+    }
+
+    /**
+     * Packet-order family. Tick boundary = ServerboundClientTickEndPacket
+     * (1.21.2+) when the client sends it, else any flying packet.
+     * @return true when the packet was fully handled here
+     */
+    private boolean packetOrder(UUID uuid, String cls, Object msg) {
+        boolean tickEnd = cls.contains("ClientTickEnd");
+        boolean flying = cls.contains("PacketPlayInFlying") || cls.contains("ServerboundMovePlayerPacket");
+        boolean interact = cls.contains("ServerboundInteractPacket") || cls.contains("PacketPlayInUseEntity");
+        boolean swing = cls.contains("ServerboundSwingPacket") || cls.contains("PacketPlayInArmAnimation");
+        boolean slot = cls.contains("ServerboundSetCarriedItemPacket") || cls.contains("PacketPlayInHeldItemSlot");
+        if (!(tickEnd || flying || interact || swing || slot)) return false;
+        PlayerData d = plugin.data().getIfLoaded(uuid);
+        if (d == null) return !flying;
+        if (tickEnd) {
+            d.tickEndSeen = true;
+            d.lastTickEndAt = System.currentTimeMillis();
+        }
+        // timer balance: one unit per CLIENT TICK (tick-end packet on 1.21.2+,
+        // else the per-tick flying packet of older protocols)
+        if (tickEnd || (flying && !d.tickEndSeen)) timerTick(d);
+        if (tickEnd || (flying && !d.tickEndSeen)) {
+            if (d.attackAwaitSwing) d.noSwingEvents++;
+            d.attackAwaitSwing = false;
+            d.lastAttackTarget = Integer.MIN_VALUE;
+            return tickEnd;
+        }
+        if (flying) return false;
+        if (swing) {
+            d.attackAwaitSwing = false;
+            return true;
+        }
+        if (interact) {
+            if (isAttack(msg)) {
+                Integer target = readIntField(msg, "entityId", "a");
+                if (target != null) {
+                    int prev = d.lastAttackTarget;
+                    if (prev != Integer.MIN_VALUE && prev != target) d.multiTargetEvents++;
+                    d.lastAttackTarget = target;
+                }
+                d.attackAwaitSwing = true;
+            }
+            return true;
+        }
+        Integer s = readIntField(msg, "slot", "a");
+        if (s != null) {
+            if (s == d.lastHeldSlot) d.duplicateSlotEvents++;
+            d.lastHeldSlot = s;
+        }
+        return true;
+    }
+
+    private volatile boolean vehicleWarned = false;
+    private static final Map<Class<?>, Field[]> VEC_FIELDS = new ConcurrentHashMap<>();
+
+    /**
+     * Vehicle position: pre-1.21.2 three doubles x/y/z on the packet; 1.21.2+
+     * a record holding a Vec3 position. Both resolved mapping-agnostically
+     * (first three non-static doubles in declaration order).
+     */
+    private static double[] readVehiclePos(Object packet) {
+        try {
+            Field[] direct = doubles(packet.getClass());
+            if (direct != null) {
+                return new double[]{direct[0].getDouble(packet), direct[1].getDouble(packet),
+                        direct[2].getDouble(packet)};
+            }
+            for (Field f : packet.getClass().getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                String tn = f.getType().getName();
+                if (tn.endsWith("Vec3") || tn.endsWith("Vec3D")) {
+                    f.setAccessible(true);
+                    Object vec = f.get(packet);
+                    Field[] vf = vec == null ? null : doubles(vec.getClass());
+                    if (vf == null) return null;
+                    return new double[]{vf[0].getDouble(vec), vf[1].getDouble(vec), vf[2].getDouble(vec)};
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static Field[] doubles(Class<?> c) {
+        Field[] cached = VEC_FIELDS.get(c);
+        if (cached != null) return cached.length == 3 ? cached : null;
+        java.util.List<Field> out = new java.util.ArrayList<>();
+        for (Field f : c.getDeclaredFields()) {
+            if (!java.lang.reflect.Modifier.isStatic(f.getModifiers()) && f.getType() == Double.TYPE) {
+                f.setAccessible(true);
+                out.add(f);
+                if (out.size() == 3) break;
+            }
+        }
+        Field[] arr = out.size() == 3 ? out.toArray(new Field[0]) : new Field[0];
+        VEC_FIELDS.put(c, arr);
+        return arr.length == 3 ? arr : null;
+    }
+
+    /** Lower clamp: lag may be caught up (burst after a stall), not banked for later. */
+    private static final long TIMER_MIN_BALANCE = -1500L;
+
+    private void timerTick(PlayerData d) {
+        long now = System.currentTimeMillis();
+        long last = d.timerLastTick;
+        d.timerLastTick = now;
+        if (last == 0L || now - d.joinTime < 5000L || now - d.lastTeleport < 1000L) {
+            d.timerBalance = 0L;
+            return;
+        }
+        long bal = d.timerBalance + 50L - (now - last);
+        if (bal < TIMER_MIN_BALANCE) bal = TIMER_MIN_BALANCE;
+        long limit = plugin.config().optLongOr(CheckType.TIMER, "balance-limit-ms", 300L);
+        if (bal > limit) {
+            d.timerFlagBalance = bal;
+            bal = 0L;
+        }
+        d.timerBalance = bal;
+    }
+
+    private static final Map<Class<?>, Boolean> ATTACK_ACTION_CACHE = new ConcurrentHashMap<>();
+    private static final Map<Class<?>, java.util.Optional<Field>> ACTION_FIELD_CACHE = new ConcurrentHashMap<>();
+
+    /**
+     * The attack action is the only interact action WITHOUT instance fields
+     * (interact / interact_at carry a hand and a location) - mapping-agnostic.
+     */
+    private static boolean isAttack(Object packet) {
+        try {
+            java.util.Optional<Field> af = ACTION_FIELD_CACHE.computeIfAbsent(packet.getClass(), c -> {
+                for (Field f : c.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                    Class<?> t = f.getType();
+                    if (!t.isPrimitive() && t.getName().startsWith("net.minecraft") && !t.isEnum()) {
+                        f.setAccessible(true);
+                        return java.util.Optional.of(f);
+                    }
+                }
+                return java.util.Optional.empty();
+            });
+            if (af.isEmpty()) return false;
+            Object action = af.get().get(packet);
+            if (action == null) return false;
+            return ATTACK_ACTION_CACHE.computeIfAbsent(action.getClass(), k -> {
+                for (Field f : k.getDeclaredFields()) {
+                    if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) return false;
+                }
+                return true;
+            });
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -274,6 +464,16 @@ public final class PacketSniffer {
         if (hit.isEmpty()) return null;
         try {
             return hit.get().getBoolean(packet);
+        } catch (IllegalAccessException e) {
+            return null;
+        }
+    }
+
+    private static Integer readIntField(Object packet, String... names) {
+        Field f = resolveField(packet.getClass(), Integer.TYPE, names);
+        if (f == null) return null;
+        try {
+            return f.getInt(packet);
         } catch (IllegalAccessException e) {
             return null;
         }

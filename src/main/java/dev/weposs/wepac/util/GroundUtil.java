@@ -12,7 +12,10 @@ public final class GroundUtil {
     private static final Set<Material> CLIMBABLE = Set.of(
             Material.LADDER, Material.VINE, Material.SCAFFOLDING,
             Material.WEEPING_VINES, Material.WEEPING_VINES_PLANT,
-            Material.TWISTING_VINES, Material.TWISTING_VINES_PLANT);
+            Material.TWISTING_VINES, Material.TWISTING_VINES_PLANT,
+            // glow-berry cave vines are climbable; powder snow is climbable in
+            // leather boots (treated as climbable: detection-lenient only)
+            Material.CAVE_VINES, Material.CAVE_VINES_PLANT, Material.POWDER_SNOW);
 
     private GroundUtil() {
     }

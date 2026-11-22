@@ -248,6 +248,11 @@ public final class PacketPhysics {
     private void process(Player player) {
         PlayerData data = plugin.data().getIfLoaded(player.getUniqueId());
         if (data == null) return;
+        try {
+            boats(player, data);
+        } catch (Throwable t) {
+            plugin.debug("VehicleSim error for " + player.getName() + ": " + t);
+        }
         Sim sim = data.physicsSim;
         if (data.packetMoves.isEmpty()) return;
 
@@ -256,16 +261,19 @@ public final class PacketPhysics {
             sim.reset();
             return;
         }
-        Check check = plugin.check(CheckType.PACKETFLY);
-        if (check == null || !check.enabled()) {
-            data.packetMoves.clear();
-            return;
-        }
-
         long now = System.currentTimeMillis();
         List<double[]> drained = new ArrayList<>(MAX_DRAIN);
         data.packetMoves.drainTo(drained, MAX_DRAIN);
         if (drained.isEmpty()) return;
+
+        try {
+            horizontal(player, data, drained, now);
+        } catch (Throwable t) {
+            plugin.debug("HorizontalSim error for " + player.getName() + ": " + t);
+        }
+
+        Check check = plugin.check(CheckType.PACKETFLY);
+        if (check == null || !check.enabled()) return;
 
         boolean exempt = player.isDead() || player.isInsideVehicle()
                 || player.getAllowFlight() || player.isFlying()
@@ -305,6 +313,272 @@ public final class PacketPhysics {
         if (serverGrounded && data.packetFlyBuffer > 0) {
             data.packetFlyBuffer = 0; // standing on ground: pending overflows were noise
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Horizontal per-packet prediction (flags as SPEED)
+    // ------------------------------------------------------------------
+
+    private void horizontal(Player player, PlayerData data, List<double[]> drained, long now) {
+        HorizontalSim hs = data.horizontalSim;
+        Check speed = plugin.check(CheckType.SPEED);
+        double[] last = drained.get(drained.size() - 1);
+        if (speed == null || !speed.enabled()
+                || !plugin.config().optBool(CheckType.SPEED, "packet-sim", true)) {
+            hs.resync(last[1], last[3], (long) last[0]);
+            return;
+        }
+        txKnockback(player, data, drained);
+        Material at = player.getLocation().getBlock().getType();
+        boolean exempt = player.isDead() || player.isInsideVehicle()
+                || player.getAllowFlight() || player.isFlying()
+                || player.isGliding() || player.isRiptiding()
+                || data.velocityExempt()
+                || lungeContext(player, data, now)
+                || GroundUtil.inLiquid(player) || GroundUtil.onClimbable(player)
+                || at == Material.COBWEB || at == Material.BUBBLE_COLUMN
+                || now - data.lastTeleport < 1500L
+                || now - data.lastRespawn < 3000L
+                || now - data.joinTime < 3000L;
+        long gta = data.groundTruthAt;
+        if (exempt || (gta > (long) drained.get(0)[0] && gta < (long) last[0])) {
+            hs.resync(last[1], last[3], (long) last[0]);
+            data.hPrevY = last[2];
+            data.hPrevGround = last[4] > 0.5;
+            return;
+        }
+        boolean serverGrounded = data.groundTruthAt != 0L && now - data.groundTruthAt <= 200L
+                ? data.groundTruth : GroundUtil.isOnGround(player);
+        int speedLvl = Math.max(0, Compat.effectAmplifier(player, Compat.SPEED) + 1);
+        double mult = plugin.config().optDouble(CheckType.SPEED, "packet-sim-multiplier", 1.0);
+        // sprint always assumed (server sprint state lags the client by a tick).
+        // The movement_speed attribute covers item/plugin modifiers on 1.21.x;
+        // the effect formula is the floor when the attribute lags the effect.
+        double attr = Compat.attribute(player, "movement_speed", 0.1);
+        double attrSprint = player.isSprinting() ? attr : attr * 1.3;
+        double moveSpeed = Math.max(0.1 * 1.3 * (1.0 + 0.2 * speedLvl), attrSprint) * mult;
+        double slip = slipperiness(player);
+        double limit = plugin.config().optDouble(CheckType.SPEED, "packet-sim-limit", 0.25);
+
+        // NoSlow: item use known for 250ms+ (server learns about use/release in
+        // packet order, the delay only guards the use-start edge)
+        boolean using = player.isHandRaised() && !player.isRiptiding()
+                && plugin.config().optBool(CheckType.NOSLOW, "packet-sim", true)
+                && plugin.check(CheckType.NOSLOW) != null && plugin.check(CheckType.NOSLOW).enabled();
+        if (using) {
+            if (data.useSince == 0L) data.useSince = now;
+        } else {
+            data.useSince = 0L;
+        }
+        boolean slowed = using && now - data.useSince > 250L;
+        hs.inputScale = slowed ? 0.2 : 1.0;
+        for (double[] mv : drained) {
+            boolean clientGround = mv[4] > 0.5;
+            boolean prevGround = data.hPrevGround;
+            double dy = Double.isNaN(data.hPrevY) ? 0.0 : mv[2] - data.hPrevY;
+            boolean jumped = prevGround && dy > 0.2;
+            // ground tick = BOTH sides agree the tick STARTED on ground; any
+            // disagreement uses air physics (whose bound converges to the same
+            // ~0.29 b/t equilibrium, so a spoofed flag buys nothing)
+            boolean ground = prevGround && serverGrounded;
+            double over = hs.onPacket(mv[1], mv[3], (long) mv[0], moveSpeed,
+                    ground ? slip : 0.6, ground, jumped, limit);
+            data.hPrevY = mv[2];
+            data.hPrevGround = clientGround;
+            if (over > 0.0) {
+                if (now - data.lastHSpeedAt > 3000L) data.hSpeedBuffer = 0;
+                data.lastHSpeedAt = now;
+                if (++data.hSpeedBuffer >= plugin.config().optInt(CheckType.SPEED, "packet-sim-buffer", 2)) {
+                    data.hSpeedBuffer = 0;
+                    if (slowed) {
+                        plugin.check(CheckType.NOSLOW).flag(player, data, String.format(Locale.ROOT,
+                                "NoSlow: +%.2f blocks beyond 0.2x input while using %s",
+                                over, player.getInventory().getItemInMainHand().getType().name()), 3);
+                    } else
+                    speed.flag(player, data, String.format(Locale.ROOT,
+                            "packet physics: +%.2f blocks beyond max vanilla horizontal acceleration", over), 3);
+                    setback(player, data);
+                    hs.reset();
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * Transaction-confirmed anti-KB: the move entry carries the knockback the
+     * client PROVABLY had when it produced this packet. The first post-ack
+     * tick must travel at least kb - (max counter-input) horizontally; anti-KB
+     * modules that cancel/scale the velocity packet cannot hide behind lag.
+     */
+    private void txKnockback(Player player, PlayerData data, List<double[]> drained) {
+        Check kb = plugin.check(CheckType.VELOCITY);
+        if (kb == null || !kb.enabled()) return;
+        HorizontalSim hs = data.horizontalSim;
+        double[] prev = Double.isNaN(hs.lastX) ? null
+                : new double[]{hs.lastTime, hs.lastX, 0, hs.lastZ, 0};
+        for (double[] mv : drained) {
+            if (mv.length > 5 && !Double.isNaN(mv[5]) && prev != null && mv[5] > 0.25
+                    && mv[0] - prev[0] >= 25 && mv[0] - prev[0] <= 150) {
+                double h = Math.hypot(mv[1] - prev[1], mv[3] - prev[3]);
+                // worst-case vanilla: full counter-input (0.13) plus ground friction
+                // on the same tick; walls eat knockback (raycast guard below)
+                double minH = mv[5] * plugin.config().optDouble(CheckType.VELOCITY, "tx-ratio", 0.5) - 0.13;
+                boolean wall = player.getWorld().rayTraceBlocks(player.getLocation().add(0, 0.1, 0),
+                        player.getVelocity().setY(0).lengthSquared() > 1e-6
+                                ? player.getVelocity().setY(0).normalize()
+                                : new org.bukkit.util.Vector(1, 0, 0),
+                        1.0, org.bukkit.FluidCollisionMode.NEVER, true) != null;
+                if (minH > 0.05 && h < minH && !player.isBlocking() && !wall
+                        && !GroundUtil.inLiquid(player)) {
+                    if (++data.txKbBuffer >= plugin.config().optInt(CheckType.VELOCITY, "tx-buffer", 2)) {
+                        data.txKbBuffer = 0;
+                        kb.flag(player, data, String.format(Locale.ROOT,
+                                "transaction-confirmed knockback %.2f b/t, moved %.2f (min %.2f)",
+                                mv[5], h, minH), 3);
+                    }
+                } else if (h >= minH) {
+                    data.txKbBuffer = Math.max(0, data.txKbBuffer - 1);
+                }
+            }
+            prev = mv;
+        }
+    }
+
+    /** Return the player to the last legal ground position (rollback config gate). */
+    private void setback(Player player, PlayerData data) {
+        if (!plugin.config().rollbackEnabled) return;
+        Location safe = data.lastGroundLocation;
+        if (safe == null || !safe.getWorld().equals(player.getWorld())) return;
+        if (safe.distanceSquared(player.getLocation()) < 0.25) return;
+        Location to = safe.clone();
+        to.setYaw(player.getLocation().getYaw());
+        to.setPitch(player.getLocation().getPitch());
+        player.teleport(to);
+        data.lastTeleport = System.currentTimeMillis();
+        data.lastLocation = to.clone();
+        data.exemptVelocity(1000L);
+    }
+
+    /**
+     * 1.21.11 Lunge: a spear attack with the Lunge enchantment launches the
+     * player forward (client-side impulse, no velocity packet).
+     */
+    private static boolean lungeContext(Player player, PlayerData data, long now) {
+        if (now - data.lastAttackAt > 1500L && !player.isHandRaised()) return false;
+        org.bukkit.inventory.ItemStack main = player.getInventory().getItemInMainHand();
+        return Compat.isSpear(main) && Compat.hasEnchant(main, Compat.LUNGE);
+    }
+
+    // ------------------------------------------------------------------
+    // Boat per-packet physics (flags as BOATFLY)
+    // ------------------------------------------------------------------
+
+    private void boats(Player player, PlayerData data) {
+        VehicleSim vs = data.vehicleSim;
+        if (data.vehicleMoves.isEmpty()) return;
+        List<double[]> moves = new ArrayList<>(MAX_DRAIN);
+        data.vehicleMoves.drainTo(moves, MAX_DRAIN);
+        Check check = plugin.check(CheckType.BOATFLY);
+        org.bukkit.entity.Entity vehicle = player.getVehicle();
+        long now = System.currentTimeMillis();
+        boolean judge = check != null && check.enabled()
+                && plugin.config().optBool(CheckType.BOATFLY, "packet-sim", true)
+                && vehicle instanceof org.bukkit.entity.Boat
+                && !player.hasPermission("wepac.bypass")
+                && now - data.lastTeleport > 1500L && now - data.joinTime > 3000L
+                && singleRider(vehicle);
+        if (!judge) {
+            vs.reset();
+            return;
+        }
+        double vLimit = plugin.config().optDouble(CheckType.BOATFLY, "sim-vertical-limit", 0.5);
+        double hLimit = plugin.config().optDouble(CheckType.BOATFLY, "sim-horizontal-limit", 0.8);
+        org.bukkit.World w = vehicle.getWorld();
+        for (double[] mv : moves) {
+            boolean airborne = boatAirborne(w, mv[1], mv[2], mv[3], vehicle);
+            if (!airborne) {
+                data.lastBoatSupport = new Location(w, mv[1], mv[2], mv[3]);
+            }
+            int r = vs.onPacket(mv[1], mv[2], mv[3], (long) mv[0], airborne, vLimit, hLimit);
+            if (r == 0) continue;
+            if (now - data.lastBoatSimAt > 3000L) data.boatSimBuffer = 0;
+            data.lastBoatSimAt = now;
+            if (++data.boatSimBuffer < plugin.config().optInt(CheckType.BOATFLY, "sim-buffer", 2)) continue;
+            data.boatSimBuffer = 0;
+            check.flag(player, data, String.format(Locale.ROOT,
+                    r == 1 ? "boat physics: rose above gravity (-0.04/tick) for %d airborne packets"
+                           : "boat physics: airborne speed beyond 0.9 drag + 0.04 paddle for %d packets",
+                    vs.airPackets), 5);
+            boatSetback(player, vehicle, data);
+            vs.reset();
+            return;
+        }
+    }
+
+    private static boolean singleRider(org.bukkit.entity.Entity vehicle) {
+        int riders = 0;
+        for (org.bukkit.entity.Entity e : vehicle.getPassengers()) {
+            if (e instanceof Player) riders++;
+        }
+        return riders == 1;
+    }
+
+    /**
+     * No support for a boat at (x,y,z): every block overlapping its box
+     * (1.375 wide) from 0.25 below to its top is passable, dry and not a
+     * bubble column, and no other entity sits beneath it.
+     */
+    private static boolean boatAirborne(org.bukkit.World w, double x, double y, double z,
+                                        org.bukkit.entity.Entity self) {
+        int minX = (int) Math.floor(x - 0.7), maxX = (int) Math.floor(x + 0.7);
+        int minZ = (int) Math.floor(z - 0.7), maxZ = (int) Math.floor(z + 0.7);
+        int minY = (int) Math.floor(y - 0.25), maxY = (int) Math.floor(y + 0.6);
+        if (!w.isChunkLoaded(minX >> 4, minZ >> 4) || !w.isChunkLoaded(maxX >> 4, maxZ >> 4)) return false;
+        for (int bx = minX; bx <= maxX; bx++) {
+            for (int by = minY; by <= maxY; by++) {
+                for (int bz = minZ; bz <= maxZ; bz++) {
+                    org.bukkit.block.Block b = w.getBlockAt(bx, by, bz);
+                    Material m = b.getType();
+                    if (m.isAir()) continue;
+                    if (!b.isPassable() || b.isLiquid() || m == Material.BUBBLE_COLUMN
+                            || m == Material.COBWEB || m == Material.SCAFFOLDING) return false;
+                    if (b.getBlockData() instanceof org.bukkit.block.data.Waterlogged wl
+                            && wl.isWaterlogged()) return false;
+                }
+            }
+        }
+        for (org.bukkit.entity.Entity e : w.getNearbyEntities(new Location(w, x, y - 0.5, z), 1.2, 0.8, 1.2)) {
+            if (e != self && !self.getPassengers().contains(e)) return false;
+        }
+        return true;
+    }
+
+    private void boatSetback(Player player, org.bukkit.entity.Entity vehicle, PlayerData data) {
+        if (!plugin.config().optBool(CheckType.BOATFLY, "setback", true)) return;
+        Location safe = data.lastBoatSupport;
+        if (safe == null || !safe.getWorld().equals(vehicle.getWorld())) return;
+        player.leaveVehicle();
+        vehicle.teleport(safe);
+        Location p = safe.clone().add(0, 0.6, 0);
+        p.setYaw(player.getLocation().getYaw());
+        p.setPitch(player.getLocation().getPitch());
+        player.teleport(p);
+        data.lastTeleport = System.currentTimeMillis();
+        data.exemptVelocity(1500L);
+    }
+
+    /** Max slipperiness of the blocks that can affect this player's movement (permissive). */
+    private static double slipperiness(Player player) {
+        Location loc = player.getLocation();
+        // vanilla: getBlockPosBelowThatAffectsMyMovement = floor(y - 0.5000001)
+        Material m = loc.clone().subtract(0, 0.5000001, 0).getBlock().getType();
+        return switch (m) {
+            case ICE, PACKED_ICE, FROSTED_ICE -> 0.98;
+            case BLUE_ICE -> 0.989;
+            case SLIME_BLOCK -> 0.8;
+            default -> 0.6;
+        };
     }
 
     private void confirm(Player player, PlayerData data, Sim sim, double over) {

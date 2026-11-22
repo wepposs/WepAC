@@ -135,6 +135,11 @@ public final class WepAC extends JavaPlugin {
                 packetSniffer.start();
                 // per-packet gravity simulation, fed by the sniffer's move queue
                 new dev.weposs.wepac.packet.PacketPhysics(this);
+                // transaction engine (ping/pong lag anchor); optional
+                if (getConfig().getBoolean("packet-sniffer.transactions", true)) {
+                    var tm = new dev.weposs.wepac.packet.TransactionManager(this, packetSniffer);
+                    if (tm.start()) packetSniffer.transactions(tm);
+                }
             } catch (Throwable t) {
                 packetSniffer = null;
                 getLogger().severe("Packet sniffer failed to start (packet checks disabled): " + t);
@@ -214,6 +219,7 @@ public final class WepAC extends JavaPlugin {
         }
         Bukkit.getPluginManager().registerEvents(new MovementMonitor(this), this);
         Bukkit.getPluginManager().registerEvents(new ConnectionListener(this), this);
+        Bukkit.getPluginManager().registerEvents(new dev.weposs.wepac.checks.combat.AimAnalyzer(this), this);
         // always-on collectors: the AI features must not depend on check toggles
         Bukkit.getPluginManager().registerEvents(new dev.weposs.wepac.data.TelemetryCollector(this), this);
         if (configManager.aiEnabled) {

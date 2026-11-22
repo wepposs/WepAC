@@ -178,6 +178,60 @@ public final class PlayerData {
     public final dev.weposs.wepac.packet.PacketPhysics.Sim physicsSim =
             new dev.weposs.wepac.packet.PacketPhysics.Sim();
     public int packetFlyBuffer = 0;
+    // ---- transaction engine (ping/pong) ----
+    public final dev.weposs.wepac.packet.TransactionState transactions =
+            new dev.weposs.wepac.packet.TransactionState();
+    public int pingSpoofStreak = 0;
+    // transaction-confirmed knockback: await id -> armed on ack -> judged on next move
+    public volatile int kbAwaitId = 0;
+    public volatile double kbAwaitH = 0, kbAwaitY = 0;
+    public volatile double kbArmedH = Double.NaN, kbArmedY = 0;
+    public volatile long kbArmedAt = 0L;
+    public int txKbBuffer = 0;
+    // packet-order state (netty thread writes, main thread consumes)
+    public volatile boolean attackAwaitSwing = false;
+    public volatile int noSwingEvents = 0;
+    public volatile int lastAttackTarget = Integer.MIN_VALUE;
+    public volatile int multiTargetEvents = 0;
+    public volatile int lastHeldSlot = -1;
+    public volatile int duplicateSlotEvents = 0;
+    public volatile boolean tickEndSeen = false;
+    public long lastSpearHeldAt = 0L;
+    // ---- AimAnalyzer (hitbox / triggerbot / aim assist) ----
+    public double[] pendingHit = null; // {time, eyeX, eyeY, eyeZ, yaw, pitch}
+    public java.util.UUID pendingHitVictim = null;
+    public int hitboxBuffer = 0;
+    public int wallHitBuffer = 0;
+    public long wallsCancelUntil = 0L;
+    public long lastBlockBreakAt = 0L;
+    public boolean crossOn = false;
+    public long crossOnSince = 0L, crossOffSince = 0L, crossWasOffFor = 0L;
+    public double crossOnCharge = 0.0;
+    public final ArrayDeque<Integer> triggerSamples = new ArrayDeque<>();
+    public float aimPrevYaw = Float.NaN;
+    public final ArrayDeque<Double> aimRatios = new ArrayDeque<>();
+    public int aimToward = 0, aimMoves = 0;
+    // ---- per-packet boat physics ----
+    public final java.util.concurrent.LinkedBlockingQueue<double[]> vehicleMoves =
+            new java.util.concurrent.LinkedBlockingQueue<>(128);
+    public final dev.weposs.wepac.packet.VehicleSim vehicleSim = new dev.weposs.wepac.packet.VehicleSim();
+    public int boatSimBuffer = 0;
+    public long lastBoatSimAt = 0L;
+    public org.bukkit.Location lastBoatSupport = null;
+    // ---- horizontal per-packet prediction ----
+    public final dev.weposs.wepac.packet.HorizontalSim horizontalSim =
+            new dev.weposs.wepac.packet.HorizontalSim();
+    public int hSpeedBuffer = 0;
+    public long useSince = 0L;
+    // ---- timer balance (netty): +50ms per client tick, -elapsed real time ----
+    public volatile long timerBalance = 0L;
+    public volatile long timerLastTick = 0L;
+    public volatile long timerFlagBalance = 0L;
+    public volatile long lastTickEndAt = 0L;
+    public int hungerSprintStreak = 0;
+    public double hPrevY = Double.NaN;
+    public boolean hPrevGround = true;
+    public long lastHSpeedAt = 0L;
     public long lastPacketFlyAt = 0L;
 
     // ---- yaw gcd ----
@@ -192,8 +246,12 @@ public final class PlayerData {
     public long bowDrawTime = 0L;
     public int speedBuffer = 0;
     public int scaffoldBuffer = 0;
+    public int scaffoldFaceBuffer = 0;
+    public int reachAvgCooldown = 0;
     public int wallClimbBuffer = 0;
     public double wallClimbStartY = 0;
+    public double climbBaseY = Double.NaN;
+    public boolean climbBaseBounce = false;
 
     // ---- nofall ----
     public boolean pendingFallDamage = false;

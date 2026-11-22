@@ -680,28 +680,56 @@ public final class MovementMonitor implements Listener {
                                 boolean exempt, boolean fresh, int lagMul) {
         Check wallClimb = plugin.check(CheckType.WALLCLIMB);
         if (wallClimb == null || !plugin.config().isEnabled(CheckType.WALLCLIMB)) return;
+        double y = player.getLocation().getY();
+        long now = System.currentTimeMillis();
 
-        if (grounded || climbing || liquid || gliding || levitating || mayFly || exempt || fresh) {
+        // Base = the last height from which vanilla could legally start rising:
+        // ground contact, or any state that grants upward motion (climbables,
+        // liquid, elytra, levitation, flight, velocity/teleport grace).
+        if (grounded || climbing || liquid || gliding || levitating || mayFly || exempt
+                || now - data.lastTeleport < 1000L || Double.isNaN(data.climbBaseY)) {
+            data.climbBaseY = y;
             data.wallClimbBuffer = 0;
+            data.climbBaseBounce = bounceBlockBelow(player);
             return;
         }
-        double minRise = plugin.config().optDouble(CheckType.WALLCLIMB, "min-rise", 0.03);
-        if (vSpeed <= minRise) {
-            data.wallClimbBuffer = 0;
-            return;
-        }
+        if (fresh) return; // sampling gap: neither judge nor move the base
+
+        // ---- A. NET-HEIGHT Spider (pattern-agnostic) ----
+        // Without support, the highest a player can get above the base is one
+        // jump (1.25 b, + Jump Boost). Pulsed/stepped/"jump-spider" modes that
+        // alternate rise and stall reset any per-sample rise streak, but they
+        // can never hide the NET height gained along the wall.
         Block wall = GroundUtil.adjacentWall(player);
-        if (wall == null) {
+        double rise = y - data.climbBaseY;
+        int jumpLvl = Math.max(0, dev.weposs.wepac.util.Compat.effectAmplifier(player,
+                dev.weposs.wepac.util.Compat.JUMP) + 1);
+        double maxJump = jumpApex(0.42 + 0.1 * jumpLvl);
+        double margin = plugin.config().optDouble(CheckType.WALLCLIMB, "net-margin", 0.2);
+        if (wall != null && !data.climbBaseBounce && rise > maxJump + margin) {
+            Material held = player.getInventory().getItemInMainHand().getType();
+            String heldInfo = held.isAir() ? "empty hand"
+                    : held.name() + (held.isBlock() ? " (block)" : " (NOT a block)");
+            wallClimb.flag(player, data, String.format(Locale.ROOT,
+                    "Spider: +%.2f blocks above last support along %s wall (vanilla max %.2f, holding %s)",
+                    rise, wall.getType().name(), maxJump, heldInfo), 4);
+            data.climbBaseY = y; // one flag per climb segment
+            rollback(player, data);
+            return;
+        }
+
+        // ---- B. sustained rise along a wall (original detector) ----
+        double minRise = plugin.config().optDouble(CheckType.WALLCLIMB, "min-rise", 0.03);
+        if (vSpeed <= minRise || wall == null) {
             data.wallClimbBuffer = 0;
             return;
         }
         if (data.wallClimbBuffer == 0) {
-            data.wallClimbStartY = player.getLocation().getY();
+            data.wallClimbStartY = y;
         }
         data.wallClimbBuffer++;
-
         double minHeight = plugin.config().optDouble(CheckType.WALLCLIMB, "min-climb-height", 1.3);
-        double climbed = player.getLocation().getY() - data.wallClimbStartY;
+        double climbed = y - data.wallClimbStartY;
         if (data.wallClimbBuffer >= 2 * lagMul && climbed > minHeight) {
             Material held = player.getInventory().getItemInMainHand().getType();
             String heldInfo = held.isAir() ? "empty hand"
@@ -712,6 +740,22 @@ public final class MovementMonitor implements Listener {
             data.wallClimbBuffer = 0;
             rollback(player, data);
         }
+    }
+
+    /** Apex height of a vanilla jump with initial vy (vy = (vy - 0.08) * 0.98 per tick). */
+    private static double jumpApex(double vy) {
+        double h = 0;
+        for (int i = 0; i < 40 && vy > 0; i++) {
+            h += vy;
+            vy = (vy - 0.08) * 0.98;
+        }
+        return h;
+    }
+
+    /** Slime/bed/honey under the feet: the next airborne arc may legally exceed a jump. */
+    private static boolean bounceBlockBelow(Player player) {
+        Material m = player.getLocation().clone().subtract(0, 0.2, 0).getBlock().getType();
+        return m == Material.SLIME_BLOCK || m.name().endsWith("_BED");
     }
 
     /**
