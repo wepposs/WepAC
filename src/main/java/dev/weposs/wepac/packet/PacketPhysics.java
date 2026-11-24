@@ -419,6 +419,14 @@ public final class PacketPhysics {
                 || GroundUtil.onClimbable(player) || bounceContext(player)
                 || Compat.effectAmplifier(player, Compat.LEVITATION) >= 0) {
             air.reset();
+            data.airSimExemptAt = now;
+            return;
+        }
+        // STICKY: the state is sampled once per batch, but the batch can span
+        // the transition (dismount, glide end, leaving water, web, ladder):
+        // packets from before the transition must not be judged as plain motion
+        if (now - data.airSimExemptAt < 1000L) {
+            air.reset();
             return;
         }
         double tolerance = plugin.config().optDouble(CheckType.SPEED, "air-accel-tolerance", 0.01);

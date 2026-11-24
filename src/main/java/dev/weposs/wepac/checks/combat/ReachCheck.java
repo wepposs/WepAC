@@ -30,7 +30,9 @@ import java.util.Locale;
 public final class ReachCheck extends Check {
 
     /** vanilla client interpolates remote players over 3 position updates */
-    private static final long INTERP_TICKS = 3L;
+    // players are tracked with updateInterval 2 and the client lerps over 3
+    // updates: it can render a position up to 6 ticks older than the newest
+    private static final long INTERP_TICKS = 6L;
     /** hard cap: withholding pongs must never stretch the window past 1s */
     private static final long MAX_BACKTRACK_TICKS = 20L;
 
@@ -78,11 +80,16 @@ public final class ReachCheck extends Check {
         long lowerTick = exact ? Math.max(ack - INTERP_TICKS, upper - MAX_BACKTRACK_TICKS) : 0L;
         if (exact) {
             // the ping allowance above becomes redundant: only movement slack remains
-            allowed = maxReach + (attacker.getVelocity().length() > 0.1 ? 0.35 : 0.0) + 0.03;
+            // the attacker's server position IS the client's position at attack
+            // time (the attack packet precedes that tick's move packet), so no
+            // movement slack is needed - only the 0.1 vanilla hitbox margin
+            allowed = maxReach + 0.1;
         }
         if (victimData != null) {
             double w = victim.getWidth();
-            double h = victim.getHeight();
+            // a victim that sneaked in the past had a different box: take the
+            // standing height so history boxes are never smaller than reality
+            double h = victim instanceof Player ? Math.max(victim.getHeight(), 1.8) : victim.getHeight();
             for (double[] pos : victimData.posHistory) {
                 if (exact && pos.length > 4) {
                     if (pos[4] < lowerTick || pos[4] > upper + 1) continue;

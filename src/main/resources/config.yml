@@ -594,6 +594,12 @@ checks:
   timer:
     enabled: true
     threshold: 8
+    # Balance timer: +50ms per move packet, -real time. Flags when the client
+    # clock gets this far ahead (vanilla never exceeds network jitter).
+    balance-limit-ms: 300
+    # how much idle time may be banked (must exceed normal sub-second lag)
+    balance-idle-clamp-ms: 1500
+    balance-buffer: 2
   blink:
     enabled: true
     threshold: 8

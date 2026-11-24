@@ -684,6 +684,65 @@ public class SelfTest {
     }
 
     // ------------------------------------------------------------------
+    // TimerBalance
+    // ------------------------------------------------------------------
+
+    static final long MS = 1_000_000L;
+    static final long CLAMP = 1500 * MS;
+
+    @Test
+    public void timerBalanceVanillaWithJitterAndLagNeverFlags() {
+        dev.weposs.wepac.packet.TimerBalance b = new dev.weposs.wepac.packet.TimerBalance();
+        Random r = new Random(7);
+        long sendT = 1_000 * MS;
+        long prevArrival = 0, stallUntil = 0;
+        // stalls (start packet -> length ms): sub-heartbeat, above heartbeat,
+        // long, very long, and a congestion phase of repeated 0.9s stalls
+        java.util.Map<Integer, Long> stalls = new java.util.HashMap<>();
+        stalls.put(300, 800L); stalls.put(700, 1400L); stalls.put(1100, 3000L); stalls.put(1500, 6000L);
+        for (int k = 0; k < 4; k++) stalls.put(1800 + k * 25, 900L);
+        for (int i = 0; i < 2200; i++) {
+            sendT += 50 * MS;
+            if (stalls.containsKey(i)) stallUntil = sendT + stalls.get(i) * MS;
+            long jitter = (long) (r.nextDouble() * 120) * MS;  // 0-120ms jitter
+            long arrival = Math.max(sendT + jitter, stallUntil);  // backlog arrives at once
+            arrival = Math.max(arrival, prevArrival);            // TCP keeps order
+            prevArrival = arrival;
+            b.onPacket(arrival, CLAMP);
+        }
+        assertTrue("vanilla peak " + b.peakMs(), b.peakMs() < 300);
+    }
+
+    @Test
+    public void timerBalanceIdleThenMoveNeverFlags() {
+        dev.weposs.wepac.packet.TimerBalance b = new dev.weposs.wepac.packet.TimerBalance();
+        long t = 1_000 * MS;
+        for (int i = 0; i < 30; i++) { t += 1000 * MS; b.onPacket(t, CLAMP); } // idle heartbeat
+        for (int i = 0; i < 400; i++) { t += 50 * MS; b.onPacket(t, CLAMP); }  // walk
+        // client freeze + 10-tick catch-up burst
+        t += 600 * MS;
+        for (int i = 0; i < 10; i++) { t += 1 * MS; b.onPacket(t, CLAMP); }
+        assertTrue("peak " + b.peakMs(), b.peakMs() < 300);
+    }
+
+    @Test
+    public void timerBalanceCatchesSlowTimer() {
+        dev.weposs.wepac.packet.TimerBalance b = new dev.weposs.wepac.packet.TimerBalance();
+        long t = 1_000 * MS;
+        for (int i = 0; i < 400; i++) { t += (long) (50 / 1.05) * MS; b.onPacket(t, CLAMP); } // 1.05x, ~19s
+        assertTrue("1.05x timer must exceed 300ms, peak " + b.peakMs(), b.peakMs() > 300);
+    }
+
+    @Test
+    public void timerBalanceIdleBankingIsCapped() {
+        dev.weposs.wepac.packet.TimerBalance b = new dev.weposs.wepac.packet.TimerBalance();
+        long t = 1_000 * MS;
+        for (int i = 0; i < 60; i++) { t += 1000 * MS; b.onPacket(t, CLAMP); } // bank a minute idle
+        for (int i = 0; i < 200; i++) { t += 25 * MS; b.onPacket(t, CLAMP); }  // 2x timer, 5s
+        assertTrue("banked credit must not hide a 2x burst, peak " + b.peakMs(), b.peakMs() > 300);
+    }
+
+    // ------------------------------------------------------------------
     // TransactionManager.TxQueue
     // ------------------------------------------------------------------
 

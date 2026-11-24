@@ -100,6 +100,8 @@ public final class PacketSniffer {
         }
     }
 
+    /** idle clamp of the balance timer, refreshed from config by the 1Hz task */
+    private volatile long timerClampNanos = 1_500_000_000L;
     private volatile boolean warned = false;
     private volatile boolean posFieldsWarned = false;
     private volatile boolean pitchWarned = false;
@@ -178,6 +180,7 @@ public final class PacketSniffer {
         PlayerData data = plugin.data().getIfLoaded(uuid);
         if (data == null) return false;
         long seq = ++data.flyingSeq;
+        data.timerBalance.onPacket(System.nanoTime(), timerClampNanos);
 
         long prevFlying = data.lastFlyingPacket;
         data.packetCounter.increment();
@@ -405,6 +408,7 @@ public final class PacketSniffer {
             }
             return;
         }
+        timerClampNanos = plugin.config().optLongOr(CheckType.TIMER, "balance-idle-clamp-ms", 1500L) * 1_000_000L;
         double maxRate = plugin.config().timerMaxRate;
         long sustainMs = plugin.config().timerSustainMs;
         long blinkTimeout = plugin.config().blinkTimeoutMs;
@@ -439,6 +443,28 @@ public final class PacketSniffer {
                     }
                 } else {
                     data.timerHighRateSince = 0L;
+                }
+            }
+
+            // BALANCE TIMER: client time running ahead of real time. Catches
+            // 1.02-1.05x timers and short timer bursts the rate check misses.
+            if (timer != null && timer.enabled()) {
+                if (now - data.lastTeleport < 2000L || now - data.lastRespawn < 3000L
+                        || now - data.joinTime < 5000L || player.isDead()) {
+                    data.timerBalance.reset();
+                } else {
+                    long peak = data.timerBalance.peakMs();
+                    long limit = plugin.config().optLongOr(CheckType.TIMER, "balance-limit-ms", 300L);
+                    if (peak > limit) {
+                        data.timerBalance.consume();
+                        if (now - data.lastTimerBalanceAt > 30000L) data.timerBalanceBuffer = 0;
+                        data.lastTimerBalanceAt = now;
+                        if (++data.timerBalanceBuffer >= plugin.config().optInt(CheckType.TIMER, "balance-buffer", 2)) {
+                            data.timerBalanceBuffer = 0;
+                            timer.flag(player, data, String.format(Locale.ROOT,
+                                    "client clock %dms ahead of real time (balance timer)", peak), 3);
+                        }
+                    }
                 }
             }
 
