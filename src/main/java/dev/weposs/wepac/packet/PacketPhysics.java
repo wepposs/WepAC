@@ -231,6 +231,162 @@ public final class PacketPhysics {
         }
     }
 
+    /**
+     * Horizontal air simulation (B1.1, pure, unit-tested).
+     *
+     * Vanilla airborne horizontal motion per tick is
+     * {@code disp(t+1) = disp(t) * 0.91 + accel}, where the input acceleration
+     * is the player's flying speed: 0.02, or 0.026 while sprinting - it is NOT
+     * affected by Speed potions, attributes or the yaw it is applied in. So in
+     * air the deviation {@code |disp(t+1) - 0.91 * disp(t)|} can never exceed
+     * 0.026, whatever the player presses. Air-strafe, air-speed, "bhop speed"
+     * and instant direction changes all break this bound by an order of
+     * magnitude, while the limit is independent of any tuned constant.
+     *
+     * Validity conditions (otherwise the pair is skipped, never charged):
+     *  - three CONSECUTIVE flying packets (seq numbers adjacent), so each
+     *    displacement is exactly one client tick;
+     *  - the two earlier packets both claimed airborne: then the friction of the
+     *    middle tick was pure air (0.91) and its acceleration was air control.
+     *    The jump tick itself (ground friction + sprint-jump boost) is excluded;
+     *  - an axis that moved LESS than predicted in the same direction is never
+     *    charged: wall collisions, attack slowdown and braking only remove speed.
+     */
+    public static final class AirSim {
+        public static final double AIR_FRICTION = 0.91;
+        public static final double MAX_ACCEL = 0.026;
+
+        private double px = Double.NaN, pz = Double.NaN;
+        private double vx = Double.NaN, vz = Double.NaN;
+        private boolean air1 = false, air0 = false;
+        private long prevSeq = -1L;
+
+        public void reset() {
+            px = pz = vx = vz = py = Double.NaN;
+            air1 = air0 = false;
+            prevSeq = -1L;
+        }
+
+        /** vanilla sprint-jump horizontal boost on the jump tick */
+        public static final double SPRINT_JUMP_BOOST = 0.2;
+
+        /** Air-only judgement (ground ticks are skipped). */
+        public double onPacket(double x, double z, boolean clientGround, long seq, double tolerance) {
+            return onPacket(x, z, clientGround, seq, tolerance, Double.NaN, 0.0);
+        }
+
+        /**
+         * Full air + ground judgement.
+         *
+         * Vanilla per tick: {@code disp(t+1) = disp(t) * f(t) + a(t+1)} where
+         *  - f(t) = 0.91 in air, blockFriction * 0.91 on ground (onGround at the
+         *    START of tick t = the claim of the packet before it),
+         *  - a(t+1) = 0.026 in air, movementSpeed * 0.216 / blockFriction^3 on
+         *    ground (onGround at the start of t+1 = claim of the previous packet),
+         *  - the jump tick (ground -> air) may add the 0.2 sprint-jump boost.
+         *
+         * @param groundFriction the HIGHEST block friction the player could be
+         *                       standing on (lenient: more friction keeps more
+         *                       speed), NaN = do not judge ground ticks
+         * @param groundAccel    upper bound of the ground input acceleration
+         * @return how far the acceleration exceeded the vanilla bound (0 = legal / not judged)
+         */
+        public double onPacket(double x, double z, boolean clientGround, long seq, double tolerance,
+                               double groundFriction, double groundAccel) {
+            return onPacket(x, Double.NaN, z, clientGround, seq, tolerance, groundFriction,
+                    groundAccel, null, null);
+        }
+
+        /** World collision probe: would the player's box, moved from (x,y,z) by (dx,dz), hit a block? */
+        public interface Blocker {
+            boolean blocked(double x, double y, double z, double dx, double dz);
+        }
+
+        /** Result of the knockback hypothesis for the last packet. */
+        public boolean lastKbJudged = false;
+        public boolean lastKbMatched = false;
+        private double py = Double.NaN;
+
+        /**
+         * @param kb      knockbacks the client MAY have applied in this tick
+         *                (each {vx, vz}; null = none possible). Vanilla replaces the
+         *                velocity, then adds input: disp = kb + accel. The packet
+         *                is legal if EITHER hypothesis (with / without kb) holds,
+         *                because without per-packet transaction ordering we cannot
+         *                know which tick the client applied it in.
+         * @param blocker collision probe; a shortfall is excused only when a
+         *                block really stops the motion (null = always excuse)
+         */
+        public double onPacket(double x, double y, double z, boolean clientGround, long seq,
+                               double tolerance, double groundFriction, double groundAccel,
+                               double[][] kb, Blocker blocker) {
+            boolean chain = prevSeq >= 0L && seq == prevSeq + 1L && !Double.isNaN(px);
+            double nvx = chain ? x - px : Double.NaN;
+            double nvz = chain ? z - pz : Double.NaN;
+            double excess = 0.0;
+            boolean groundModel = !Double.isNaN(groundFriction);
+            boolean startAir = air1;
+            double accel = startAir ? MAX_ACCEL : groundAccel;
+            if (!startAir && !clientGround) accel += SPRINT_JUMP_BOOST; // jump tick
+            if (chain && !Double.isNaN(vx) && ((air0 && air1) || groundModel)) {
+                double f = air0 ? AIR_FRICTION : groundFriction * AIR_FRICTION;
+                double rx = residual(nvx, f * vx);
+                double rz = residual(nvz, f * vz);
+                double r = Math.sqrt(rx * rx + rz * rz);
+                excess = Math.max(0.0, r - accel - tolerance);
+            }
+            lastKbJudged = false;
+            lastKbMatched = false;
+            if (kb != null && kb.length > 0 && chain && (startAir || groundModel)) {
+                // velocity replaced by kb, then input added, then moved. Every
+                // still-pending knockback is a candidate (combo hits can land
+                // in the same client tick - the last one wins there)
+                double best = Double.MAX_VALUE;
+                for (double[] k : kb) {
+                    double rx = kbResidual(nvx, k[0], blocker, true);
+                    double rz = kbResidual(nvz, k[1], blocker, false);
+                    double r = Math.sqrt(rx * rx + rz * rz);
+                    best = Math.min(best, Math.max(0.0, r - accel - tolerance));
+                }
+                lastKbJudged = true;
+                lastKbMatched = best <= 0.0;
+                excess = Math.min(excess, best);
+            }
+            px = x;
+            py = y;
+            pz = z;
+            vx = nvx;
+            vz = nvz;
+            air0 = air1;
+            air1 = !clientGround;
+            prevSeq = seq;
+            return excess;
+        }
+
+        /**
+         * Per-axis deviation from the knockback hypothesis. Falling SHORT of the
+         * knockback is the anti-KB signature, so unlike {@link #residual} it is
+         * excused only when the collision probe confirms a block in the way.
+         */
+        private double kbResidual(double actual, double expected, Blocker blocker, boolean xAxis) {
+            if (Math.abs(actual) <= Math.abs(expected) && actual * expected >= 0.0) {
+                if (blocker == null || Double.isNaN(py)) return 0.0;
+                double ax = xAxis ? expected : 0.0;
+                double az = xAxis ? 0.0 : expected;
+                if (blocker.blocked(px, py, pz, ax, az)) return 0.0;
+            }
+            return actual - expected;
+        }
+
+        /** Per-axis deviation; a same-direction slowdown is explained by collision. */
+        static double residual(double actual, double expected) {
+            if (Math.abs(actual) <= Math.abs(expected) && actual * expected >= 0.0) {
+                return 0.0;
+            }
+            return actual - expected;
+        }
+    }
+
     // ------------------------------------------------------------------
     // Main-thread evaluation
     // ------------------------------------------------------------------
@@ -254,11 +410,7 @@ public final class PacketPhysics {
         if (player.hasPermission("wepac.bypass")) {
             data.packetMoves.clear();
             sim.reset();
-            return;
-        }
-        Check check = plugin.check(CheckType.PACKETFLY);
-        if (check == null || !check.enabled()) {
-            data.packetMoves.clear();
+            data.airSim.reset();
             return;
         }
 
@@ -274,6 +426,22 @@ public final class PacketPhysics {
                 || now - data.lastTeleport < 1500L
                 || now - data.lastRespawn < 3000L
                 || now - data.joinTime < 3000L;
+
+        // the horizontal simulation models transaction-synced knockback itself;
+        // only velocity it cannot model (explosions, pushes, plugins) exempts it
+        boolean airExempt = player.isDead() || player.isInsideVehicle()
+                || player.getAllowFlight() || player.isFlying()
+                || player.isGliding() || player.isRiptiding()
+                || data.unmodelledVelocityExempt()
+                || now - data.lastTeleport < 1500L
+                || now - data.lastRespawn < 3000L
+                || now - data.joinTime < 3000L;
+        processAir(player, data, drained, airExempt, now);
+
+        Check check = plugin.check(CheckType.PACKETFLY);
+        if (check == null || !check.enabled()) {
+            return;
+        }
         if (exempt) {
             sim.resync(drained.get(drained.size() - 1)[2], now);
             return;
@@ -305,6 +473,220 @@ public final class PacketPhysics {
         if (serverGrounded && data.packetFlyBuffer > 0) {
             data.packetFlyBuffer = 0; // standing on ground: pending overflows were noise
         }
+    }
+
+    /** Horizontal air simulation over this tick's packet batch (flags SPEED). */
+    private void processAir(Player player, PlayerData data, List<double[]> drained,
+                            boolean exempt, long now) {
+        AirSim air = data.airSim;
+        Check speed = plugin.check(CheckType.SPEED);
+        if (speed == null || !speed.enabled()
+                || !plugin.config().optBool(CheckType.SPEED, "air-simulation", true)) {
+            dropAckedKbs(data, drained);
+            return;
+        }
+        // contexts whose horizontal physics is not plain air: resync, never charge
+        if (exempt || data.bedrock() || GroundUtil.inLiquid(player)
+                || GroundUtil.onClimbable(player) || bounceContext(player)
+                || Compat.effectAmplifier(player, Compat.LEVITATION) >= 0) {
+            air.reset();
+            data.airSimExemptAt = now;
+            dropAckedKbs(data, drained);
+            return;
+        }
+        // STICKY: the state is sampled once per batch, but the batch can span
+        // the transition (dismount, glide end, leaving water, web, ladder):
+        // packets from before the transition must not be judged as plain motion
+        if (now - data.airSimExemptAt < 1000L) {
+            air.reset();
+            dropAckedKbs(data, drained);
+            return;
+        }
+        double tolerance = plugin.config().optDouble(CheckType.SPEED, "air-accel-tolerance", 0.01);
+        boolean groundSim = plugin.config().optBool(CheckType.SPEED, "ground-simulation", true);
+        double friction = Double.NaN;
+        if (groundSim) {
+            // ice momentum survives the step onto stone: keep the highest
+            // friction seen in the last 1.5s (the batch may span the edge)
+            double f = maxFrictionBelow(player);
+            if (f >= data.recentFriction || now - data.recentFrictionAt > 1500L) {
+                data.recentFriction = f;
+                data.recentFrictionAt = now;
+            }
+            friction = Math.max(f, data.recentFriction);
+        }
+        double groundAccel = groundSim ? groundAccelBound(player) : 0.0;
+        org.bukkit.World world = player.getWorld();
+        AirSim.Blocker blocker = (x, y, z, dx, dz) -> collides(world, x + dx, y, z + dz);
+        double worst = 0.0;
+        double kbShortfallWorst = -1.0;
+        for (double[] mv : drained) {
+            if (mv.length < 6) continue;
+            long ack = mv.length > 6 ? (long) mv[6] : -1L;
+            double[][] kbs = null;
+            if (!data.pendingKbs.isEmpty()) {
+                kbs = new double[data.pendingKbs.size()][];
+                int i = 0;
+                for (double[] k : data.pendingKbs) kbs[i++] = new double[]{k[1], k[2]};
+            }
+            double over = air.onPacket(mv[1], mv[2], mv[3], mv[4] > 0.5, (long) mv[5], tolerance,
+                    friction, groundAccel, kbs, blocker);
+            worst = Math.max(worst, over);
+            if (kbs == null) continue;
+            if (air.lastKbJudged) data.kbWindowJudged = true;
+            else data.kbWindowBlind = true; // this tick could have been THE kb tick
+            if (air.lastKbMatched) data.kbWindowMatched = true;
+            double[] head = data.pendingKbs.peekFirst();
+            if (ack >= (long) head[0]) {
+                // decisive packet: the client confirmed it had the knockback
+                // BEFORE sending this move, so it was applied in some tick of
+                // the window. If no tick ever matched it, the client ignored it.
+                double h = Math.hypot(head[1], head[2]);
+                if (data.kbWindowJudged && !data.kbWindowBlind && !data.kbWindowMatched && h >= 0.1) {
+                    kbShortfallWorst = Math.max(kbShortfallWorst, h);
+                }
+                // knockbacks the client confirmed in the same breath were
+                // superseded inside one tick: they are settled together
+                while (!data.pendingKbs.isEmpty() && ack >= (long) data.pendingKbs.peekFirst()[0]) {
+                    data.pendingKbs.pollFirst();
+                }
+                data.kbWindowJudged = false;
+                data.kbWindowMatched = false;
+                data.kbWindowBlind = false;
+            }
+        }
+        if (kbShortfallWorst > 0.0) {
+            judgeKnockback(player, data, kbShortfallWorst, now);
+        }
+        if (worst <= 0.0) return;
+        // entity pushing (crowds, mobs) adds real horizontal velocity: the
+        // scan is only paid for when the bound was actually broken
+        if (!player.getNearbyEntities(1.2, 1.5, 1.2).isEmpty()) return;
+        if (now - data.lastAirStrafeAt > 2000L) data.airStrafeBuffer = 0;
+        data.lastAirStrafeAt = now;
+        data.airStrafeBuffer++;
+        if (data.airStrafeBuffer < plugin.config().optInt(CheckType.SPEED, "air-buffer", 3)) return;
+        data.airStrafeBuffer = 0;
+        speed.flag(player, data, String.format(Locale.ROOT,
+                "movement simulation: horizontal acceleration %.3f above the vanilla friction/input bound",
+                worst), 2);
+    }
+
+    /**
+     * Unjudged batch: knockbacks confirmed by any packet in it are settled
+     * without a verdict, and the open window is marked blind - judging a later
+     * packet against an already-applied knockback would be a false positive.
+     */
+    private static void dropAckedKbs(PlayerData data, List<double[]> drained) {
+        if (data.pendingKbs.isEmpty()) return;
+        data.kbWindowBlind = true;
+        long maxAck = -1L;
+        for (double[] mv : drained) {
+            if (mv.length > 6) maxAck = Math.max(maxAck, (long) mv[6]);
+        }
+        while (!data.pendingKbs.isEmpty() && maxAck >= (long) data.pendingKbs.peekFirst()[0]) {
+            data.pendingKbs.pollFirst();
+        }
+        if (data.pendingKbs.isEmpty()) {
+            data.kbWindowBlind = false;
+            data.kbWindowJudged = false;
+            data.kbWindowMatched = false;
+        }
+    }
+
+    /**
+     * Collision probe against real block collision shapes (slabs, fences,
+     * walls, panes - not just full cubes): is the 0.6x1.8 player box at
+     * (x, y, z) intersecting any block? Used only to EXCUSE a knockback
+     * shortfall, so a probe error can only cost a detection, never a ban.
+     */
+    static boolean collides(org.bukkit.World w, double x, double y, double z) {
+        org.bukkit.util.BoundingBox box = new org.bukkit.util.BoundingBox(
+                x - 0.3, y + 0.001, z - 0.3, x + 0.3, y + 1.8, z + 0.3).expand(0.03);
+        int minX = (int) Math.floor(box.getMinX()), maxX = (int) Math.floor(box.getMaxX());
+        int minY = (int) Math.floor(box.getMinY()), maxY = (int) Math.floor(box.getMaxY());
+        int minZ = (int) Math.floor(box.getMinZ()), maxZ = (int) Math.floor(box.getMaxZ());
+        for (int bx = minX; bx <= maxX; bx++) {
+            for (int by = minY; by <= maxY; by++) {
+                for (int bz = minZ; bz <= maxZ; bz++) {
+                    org.bukkit.block.Block b = w.getBlockAt(bx, by, bz);
+                    if (b.isPassable()) continue;
+                    try {
+                        for (org.bukkit.util.BoundingBox s : b.getCollisionShape().getBoundingBoxes()) {
+                            if (s.clone().shift(bx, by, bz).overlaps(box)) return true;
+                        }
+                    } catch (Throwable t) {
+                        return true; // unknown shape: excuse, never accuse
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Anti-KB verdict from the transaction-synced simulation (flags VELOCITY). */
+    private void judgeKnockback(Player player, PlayerData data, double kbLen, long now) {
+        Check kb = plugin.check(CheckType.VELOCITY);
+        if (kb == null || !kb.enabled() || player.isBlocking()) return;
+        // other entities can absorb/redirect knockback by pushing
+        if (!player.getNearbyEntities(1.2, 1.5, 1.2).isEmpty()) return;
+        if (now - data.lastSimKbAt > 10000L) data.simKbBuffer = 0;
+        data.lastSimKbAt = now;
+        if (++data.simKbBuffer < plugin.config().optInt(CheckType.VELOCITY, "sim-buffer", 2)) return;
+        data.simKbBuffer = 0;
+        kb.flag(player, data, String.format(Locale.ROOT,
+                "ignored knockback: %.2f b/t never applied in any acknowledged tick (transaction-synced)",
+                kbLen), 4);
+    }
+
+    /** Vanilla block slipperiness (Block#getFriction); Bukkit exposes none. */
+    static double blockFriction(Material m) {
+        String n = m.name();
+        if (n.equals("BLUE_ICE")) return 0.989;
+        if (n.endsWith("ICE")) return 0.98; // ICE, PACKED_ICE, FROSTED_ICE
+        if (m == Material.SLIME_BLOCK) return 0.8;
+        return 0.6;
+    }
+
+    /**
+     * Highest friction among the blocks the player's footprint could rest on
+     * (vanilla reads y-0.5; we also look one block lower and at every corner,
+     * so an ice edge or a batch spanning a block border is never misjudged).
+     */
+    private static double maxFrictionBelow(Player player) {
+        org.bukkit.util.BoundingBox box = player.getBoundingBox();
+        org.bukkit.World w = player.getWorld();
+        double best = 0.6;
+        double[] ys = {box.getMinY() - 0.5, box.getMinY() - 1.0};
+        double[][] corners = {{box.getMinX(), box.getMinZ()}, {box.getMinX(), box.getMaxZ()},
+                {box.getMaxX(), box.getMinZ()}, {box.getMaxX(), box.getMaxZ()}};
+        for (double y : ys) {
+            for (double[] c : corners) {
+                Material m = w.getBlockAt((int) Math.floor(c[0]), (int) Math.floor(y),
+                        (int) Math.floor(c[1])).getType();
+                best = Math.max(best, blockFriction(m));
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Upper bound of ground input acceleration: movementSpeed * 0.216 / f^3 is
+     * largest on default-friction (0.6) blocks, where it equals movementSpeed.
+     * The attribute already carries Speed/Slowness, Soul Speed and plugin
+     * modifiers; the sprint factor is always granted because the client may
+     * toggle sprint inside the batch before the server attribute follows.
+     */
+    private static double groundAccelBound(Player player) {
+        double speed;
+        try {
+            speed = player.getAttribute(org.bukkit.attribute.Attribute.MOVEMENT_SPEED).getValue();
+            if (!player.isSprinting()) speed *= 1.3;
+        } catch (Throwable t) {
+            int lvl = Math.max(0, Compat.effectAmplifier(player, Compat.SPEED));
+            speed = 0.1 * 1.3 * (1.0 + 0.2 * lvl);
+        }
+        return speed * (0.21600002 / 0.216);
     }
 
     private void confirm(Player player, PlayerData data, Sim sim, double over) {

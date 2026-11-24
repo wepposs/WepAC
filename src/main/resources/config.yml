@@ -360,6 +360,16 @@ checks:
     # Max allowed = vanilla_limit * multiplier (vanilla sprint-jump ~0.29 b/tick)
     multiplier: 1.45
     buffer: 8
+    # Per-packet horizontal AIR simulation: in air |disp(t+1) - 0.91*disp(t)|
+    # can never exceed 0.026 (vanilla air control, independent of Speed potions).
+    # Catches air-strafe / air-speed far below the multiplier limit above.
+    air-simulation: true
+    # Extends the same per-packet model to ground ticks: disp*blockFriction*0.91
+    # + movementSpeed attribute (ice/slime friction, Speed potions, Soul Speed
+    # and sprint-jump boost are modelled). Requires air-simulation.
+    ground-simulation: true
+    air-accel-tolerance: 0.01
+    air-buffer: 3
   jesus:
     enabled: true
     threshold: 15
@@ -584,12 +594,21 @@ checks:
   timer:
     enabled: true
     threshold: 8
+    # Balance timer: +50ms per move packet, -real time. Flags when the client
+    # clock gets this far ahead (vanilla never exceeds network jitter).
+    balance-limit-ms: 300
+    # how much idle time may be banked (must exceed normal sub-second lag)
+    balance-idle-clamp-ms: 1500
+    balance-buffer: 2
   blink:
     enabled: true
     threshold: 8
   badpackets:
     enabled: true
     threshold: 5
+    # Transaction layer (ping/pong tick sync): a client that keeps sending
+    # movement but holds back our pongs this long is spoofing its ping.
+    transaction-timeout-ms: 15000
   packetfly:
     enabled: true
     threshold: 16

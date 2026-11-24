@@ -178,6 +178,40 @@ public final class PlayerData {
     public final dev.weposs.wepac.packet.PacketPhysics.Sim physicsSim =
             new dev.weposs.wepac.packet.PacketPhysics.Sim();
     public int packetFlyBuffer = 0;
+
+    // ---- transactions (ping/pong tick sync) ----
+    public final dev.weposs.wepac.packet.TransactionManager.TxQueue tx =
+            new dev.weposs.wepac.packet.TransactionManager.TxQueue();
+    /** acked tick snapshotted on the netty thread when the attack packet arrived */
+    public volatile long ackTickAtAttack = -1L;
+    /** server tick at the moment the attack packet arrived */
+    public volatile long tickAtAttack = -1L;
+    /** server tick in which the last knockback was applied (-1 = none) */
+    public long pendingKbTick = -1L;
+    /** monotonically increasing counter of ALL flying packets (pos or not) */
+    public volatile long flyingSeq = 0L;
+    // ---- horizontal air simulation ----
+    public final dev.weposs.wepac.packet.PacketPhysics.AirSim airSim =
+            new dev.weposs.wepac.packet.PacketPhysics.AirSim();
+    public int airStrafeBuffer = 0;
+    public long airSimExemptAt = 0L;
+    /** knockbacks sent to the client and not yet acknowledged: {tick, vx, vz} (main thread only) */
+    public final java.util.ArrayDeque<double[]> pendingKbs = new java.util.ArrayDeque<>();
+    public boolean kbWindowMatched = false;
+    public boolean kbWindowJudged = false;
+    public boolean kbWindowBlind = false;
+    public int simKbBuffer = 0;
+    public long lastSimKbAt = 0L;
+    /** velocity exemption from sources the simulation does NOT model (main thread) */
+    public long unmodelledVelocityUntil = 0L;
+    // ---- balance timer (netty thread writes, main thread reads/resets) ----
+    public final dev.weposs.wepac.packet.TimerBalance timerBalance =
+            new dev.weposs.wepac.packet.TimerBalance();
+    public int timerBalanceBuffer = 0;
+    public long lastTimerBalanceAt = 0L;
+    public double recentFriction = 0.6;
+    public long recentFrictionAt = 0L;
+    public long lastAirStrafeAt = 0L;
     public long lastPacketFlyAt = 0L;
 
     // ---- yaw gcd ----
@@ -276,6 +310,20 @@ public final class PlayerData {
 
     public void exemptVelocity(long ms) {
         velocityExemptUntil = Math.max(velocityExemptUntil, System.currentTimeMillis() + ms);
+        unmodelledVelocityUntil = Math.max(unmodelledVelocityUntil, System.currentTimeMillis() + ms);
+    }
+
+    /**
+     * Exemption for velocity the horizontal simulation models exactly via
+     * transactions (PlayerVelocityEvent): the vertical/heuristic layers still
+     * stand down, the horizontal simulation keeps judging.
+     */
+    public void exemptVelocityModelled(long ms) {
+        velocityExemptUntil = Math.max(velocityExemptUntil, System.currentTimeMillis() + ms);
+    }
+
+    public boolean unmodelledVelocityExempt() {
+        return System.currentTimeMillis() < unmodelledVelocityUntil;
     }
 
     public int vl(CheckType type) {

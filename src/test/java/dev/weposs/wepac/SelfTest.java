@@ -585,6 +585,272 @@ public class SelfTest {
     }
 
     // ------------------------------------------------------------------
+    // PacketPhysics.AirSim (horizontal air control bound)
+    // ------------------------------------------------------------------
+
+    /** Simulates vanilla air ticks with a given input angle per tick; returns worst excess. */
+    static double runAir(PacketPhysics.AirSim sim, double startV, double accel,
+                         java.util.function.IntToDoubleFunction yawAt, int ticks) {
+        double x = 0, z = 0, vx = startV, vz = 0, worst = 0;
+        long seq = 1;
+        sim.onPacket(x, z, true, seq++, 0.01);          // ground before jump
+        x += vx; z += vz;
+        sim.onPacket(x, z, false, seq++, 0.01);         // jump tick (excluded)
+        for (int i = 0; i < ticks; i++) {
+            vx *= 0.91; vz *= 0.91;
+            double a = yawAt.applyAsDouble(i);
+            vx += Math.cos(a) * accel; vz += Math.sin(a) * accel;
+            x += vx; z += vz;
+            worst = Math.max(worst, sim.onPacket(x, z, false, seq++, 0.01));
+        }
+        return worst;
+    }
+
+    @Test
+    public void airSimVanillaStrafeNeverFlags() {
+        // sprint-jump at full speed, then hard 90deg/180deg input changes mid-air
+        assertEquals(0.0, runAir(new PacketPhysics.AirSim(), 0.6, 0.026, i -> i * 1.7, 12), 1e-12);
+        assertEquals(0.0, runAir(new PacketPhysics.AirSim(), 0.3, 0.026, i -> Math.PI, 12), 1e-12);
+        assertEquals(0.0, runAir(new PacketPhysics.AirSim(), 0.0, 0.02, i -> 0.3, 12), 1e-12);
+    }
+
+    @Test
+    public void airSimSpeedAndStrafeHacksFlag() {
+        // air-speed: 0.06/tick acceleration
+        assertTrue(runAir(new PacketPhysics.AirSim(), 0.3, 0.06, i -> 0.0, 10) > 0.0);
+        // instant air-strafe: velocity re-pointed to the input direction every tick
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        double x = 0, z = 0, worst = 0;
+        long seq = 1;
+        sim.onPacket(x, z, false, seq++, 0.01);
+        for (int i = 0; i < 10; i++) {
+            double a = i * Math.PI / 2;  // 90 degree turns, speed kept at 0.28
+            x += Math.cos(a) * 0.28; z += Math.sin(a) * 0.28;
+            worst = Math.max(worst, sim.onPacket(x, z, false, seq++, 0.01));
+        }
+        assertTrue("strafe must flag", worst > 0.2);
+    }
+
+    @Test
+    public void airSimWallCollisionAndGapsNoFlag() {
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        long seq = 1;
+        sim.onPacket(0, 0, false, seq++, 0.01);
+        sim.onPacket(0.5, 0, false, seq++, 0.01);
+        // wall: x stops dead
+        assertEquals(0.0, sim.onPacket(0.5, 0, false, seq++, 0.01), 1e-12);
+        // a non-position packet in between breaks the chain: no judgement
+        seq += 1;
+        assertEquals(0.0, sim.onPacket(3.0, 0, false, seq++, 0.01), 1e-12);
+    }
+
+    /** Vanilla ground walk/sprint/jump cycle with the full air+ground model. */
+    static double runGround(double speedAttr, double friction, double claimedAccel, boolean bhop) {
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        double groundAccel = 0.1 * 1.3 * (speedAttr / 0.1); // bound as computed in plugin
+        double x = 0, v = 0, worst = 0;
+        long seq = 1;
+        boolean onGround = true;
+        int airT = 0;
+        for (int i = 0; i < 60; i++) {
+            boolean startGround = onGround;
+            double f = startGround ? friction * 0.91 : 0.91;
+            double a = startGround ? claimedAccel : 0.026;
+            boolean jump = bhop && startGround && i > 5;
+            double dv = v + a + (jump ? 0.2 : 0.0);
+            x += dv;
+            v = dv * f;
+            if (jump) { onGround = false; airT = 0; }
+            else if (!onGround && ++airT >= 11) onGround = true;
+            worst = Math.max(worst, sim.onPacket(x, 0, onGround, seq++, 0.01, friction, groundAccel));
+        }
+        return worst;
+    }
+
+    @Test
+    public void groundSimVanillaNeverFlags() {
+        assertEquals("sprint", 0.0, runGround(0.13, 0.6, 0.13, false), 1e-12);
+        assertEquals("sprint-bhop", 0.0, runGround(0.13, 0.6, 0.13, true), 1e-12);
+        assertEquals("speed II bhop", 0.0, runGround(0.182, 0.6, 0.182, true), 1e-12);
+        assertEquals("ice bhop", 0.0, runGround(0.13, 0.98, 0.13 * 0.216 / Math.pow(0.98, 3), true), 1e-12);
+    }
+
+    @Test
+    public void groundSimSpeedHackFlags() {
+        // ground speed hack: 1.6x the legal input acceleration
+        assertTrue(runGround(0.13, 0.6, 0.13 * 1.6, false) > 0.0);
+        // bhop-speed: every hop 1.5x
+        assertTrue(runGround(0.13, 0.6, 0.2, true) > 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // Knockback hypothesis (transaction-synced anti-KB)
+    // ------------------------------------------------------------------
+
+    /**
+     * Airborne player moving +x; knockback (-0.45, 0.2) is offered as a
+     * candidate for 4 packets, the client applies {@code takeFraction} of it at
+     * packet {@code applyAt}. Returns {worstExcess, matchedAny}.
+     */
+    static double[] runKb(double takeFraction, int applyAt, PacketPhysics.AirSim.Blocker blocker) {
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        double[][] kb = {{-0.45, 0.2}};
+        double x = 0, z = 0, vx = 0.25, vz = 0, worst = 0;
+        boolean matched = false;
+        long seq = 1;
+        sim.onPacket(x, 70, z, false, seq++, 0.01, 0.6, 0.13, null, blocker);
+        for (int i = 0; i < 8; i++) {
+            if (i == applyAt) { vx = kb[0][0] * takeFraction; vz = kb[0][1] * takeFraction; }
+            double dvx = vx + 0.026, dvz = vz;   // input: forward (+x)
+            x += dvx; z += dvz;
+            vx = dvx * 0.91; vz = dvz * 0.91;
+            boolean offered = i >= 1 && i <= 4;
+            worst = Math.max(worst, sim.onPacket(x, 70, z, false, seq++, 0.01, 0.6, 0.13,
+                    offered ? kb : null, blocker));
+            if (offered && sim.lastKbMatched) matched = true;
+        }
+        return new double[]{worst, matched ? 1 : 0};
+    }
+
+    @Test
+    public void kbVanillaTakesKnockbackNeverFlags() {
+        PacketPhysics.AirSim.Blocker open = (x, y, z, dx, dz) -> false;
+        for (int at = 1; at <= 4; at++) {
+            double[] r = runKb(1.0, at, open);
+            assertEquals("kb applied at tick " + at + " flagged", 0.0, r[0], 1e-12);
+            assertEquals("kb at tick " + at + " must match", 1.0, r[1], 0);
+        }
+    }
+
+    @Test
+    public void kbIgnoredIsDetected() {
+        PacketPhysics.AirSim.Blocker open = (x, y, z, dx, dz) -> false;
+        assertEquals("100% anti-KB must not match", 0.0, runKb(0.0, 2, open)[1], 0);
+        assertEquals("80% reduction must not match", 0.0, runKb(0.2, 2, open)[1], 0);
+    }
+
+    @Test
+    public void kbIntoWallIsExcused() {
+        // a wall right behind the player stops the knockback on both axes
+        // pressed into a corner: vanilla collision zeroes both axes every tick
+        PacketPhysics.AirSim.Blocker wall = (x, y, z, dx, dz) -> true;
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        double[][] kb = {{-0.45, 0.2}};
+        long seq = 1;
+        boolean matched = false;
+        sim.onPacket(5, 70, 5, false, seq++, 0.01, 0.6, 0.13, null, wall);
+        for (int i = 0; i < 4; i++) {
+            sim.onPacket(5, 70, 5, false, seq++, 0.01, 0.6, 0.13, kb, wall);
+            matched |= sim.lastKbMatched;
+        }
+        assertTrue("knockback into a corner must be excused", matched);
+        // the same zero motion in the OPEN must not be excused (that is anti-KB)
+        PacketPhysics.AirSim.Blocker open = (x, y, z, dx, dz) -> false;
+        sim = new PacketPhysics.AirSim();
+        seq = 1;
+        matched = false;
+        sim.onPacket(5, 70, 5, false, seq++, 0.01, 0.6, 0.13, null, open);
+        for (int i = 0; i < 4; i++) {
+            sim.onPacket(5, 70, 5, false, seq++, 0.01, 0.6, 0.13, kb, open);
+            matched |= sim.lastKbMatched;
+        }
+        assertFalse("standing still in the open under knockback = anti-KB", matched);
+    }
+
+    // ------------------------------------------------------------------
+    // TimerBalance
+    // ------------------------------------------------------------------
+
+    static final long MS = 1_000_000L;
+    static final long CLAMP = 1500 * MS;
+
+    @Test
+    public void timerBalanceVanillaWithJitterAndLagNeverFlags() {
+        dev.weposs.wepac.packet.TimerBalance b = new dev.weposs.wepac.packet.TimerBalance();
+        Random r = new Random(7);
+        long sendT = 1_000 * MS;
+        long prevArrival = 0, stallUntil = 0;
+        // stalls (start packet -> length ms): sub-heartbeat, above heartbeat,
+        // long, very long, and a congestion phase of repeated 0.9s stalls
+        java.util.Map<Integer, Long> stalls = new java.util.HashMap<>();
+        stalls.put(300, 800L); stalls.put(700, 1400L); stalls.put(1100, 3000L); stalls.put(1500, 6000L);
+        for (int k = 0; k < 4; k++) stalls.put(1800 + k * 25, 900L);
+        for (int i = 0; i < 2200; i++) {
+            sendT += 50 * MS;
+            if (stalls.containsKey(i)) stallUntil = sendT + stalls.get(i) * MS;
+            long jitter = (long) (r.nextDouble() * 120) * MS;  // 0-120ms jitter
+            long arrival = Math.max(sendT + jitter, stallUntil);  // backlog arrives at once
+            arrival = Math.max(arrival, prevArrival);            // TCP keeps order
+            prevArrival = arrival;
+            b.onPacket(arrival, CLAMP);
+        }
+        assertTrue("vanilla peak " + b.peakMs(), b.peakMs() < 300);
+    }
+
+    @Test
+    public void timerBalanceIdleThenMoveNeverFlags() {
+        dev.weposs.wepac.packet.TimerBalance b = new dev.weposs.wepac.packet.TimerBalance();
+        long t = 1_000 * MS;
+        for (int i = 0; i < 30; i++) { t += 1000 * MS; b.onPacket(t, CLAMP); } // idle heartbeat
+        for (int i = 0; i < 400; i++) { t += 50 * MS; b.onPacket(t, CLAMP); }  // walk
+        // client freeze + 10-tick catch-up burst
+        t += 600 * MS;
+        for (int i = 0; i < 10; i++) { t += 1 * MS; b.onPacket(t, CLAMP); }
+        assertTrue("peak " + b.peakMs(), b.peakMs() < 300);
+    }
+
+    @Test
+    public void timerBalanceCatchesSlowTimer() {
+        dev.weposs.wepac.packet.TimerBalance b = new dev.weposs.wepac.packet.TimerBalance();
+        long t = 1_000 * MS;
+        for (int i = 0; i < 400; i++) { t += (long) (50 / 1.05) * MS; b.onPacket(t, CLAMP); } // 1.05x, ~19s
+        assertTrue("1.05x timer must exceed 300ms, peak " + b.peakMs(), b.peakMs() > 300);
+    }
+
+    @Test
+    public void timerBalanceIdleBankingIsCapped() {
+        dev.weposs.wepac.packet.TimerBalance b = new dev.weposs.wepac.packet.TimerBalance();
+        long t = 1_000 * MS;
+        for (int i = 0; i < 60; i++) { t += 1000 * MS; b.onPacket(t, CLAMP); } // bank a minute idle
+        for (int i = 0; i < 200; i++) { t += 25 * MS; b.onPacket(t, CLAMP); }  // 2x timer, 5s
+        assertTrue("banked credit must not hide a 2x burst, peak " + b.peakMs(), b.peakMs() > 300);
+    }
+
+    // ------------------------------------------------------------------
+    // TransactionManager.TxQueue
+    // ------------------------------------------------------------------
+
+    @Test
+    public void txQueueInOrderAcks() {
+        dev.weposs.wepac.packet.TransactionManager.TxQueue q =
+                new dev.weposs.wepac.packet.TransactionManager.TxQueue();
+        int a = q.send(10, 0), b = q.send(11, 50);
+        assertTrue("ids must be negative", a < 0 && b < 0 && a != b);
+        assertEquals(-1L, q.ackedTick());
+        assertTrue(q.onPong(a, 80));
+        assertEquals(10L, q.ackedTick());
+        assertEquals(80L, q.rttMs());
+        assertTrue(q.onPong(b, 130));
+        assertEquals(11L, q.ackedTick());
+        assertEquals(0L, q.consumeOutOfOrder());
+        assertFalse("positive ids are not ours", q.onPong(5, 140));
+    }
+
+    @Test
+    public void txQueueOutOfOrderAndWithholding() {
+        dev.weposs.wepac.packet.TransactionManager.TxQueue q =
+                new dev.weposs.wepac.packet.TransactionManager.TxQueue();
+        int a = q.send(1, 0);
+        int b = q.send(2, 50);
+        q.send(3, 100);
+        assertEquals(20000L, q.oldestPendingAge(20000));
+        assertTrue(q.onPong(b, 200));       // skipped a
+        assertEquals(1L, q.consumeOutOfOrder());
+        assertEquals(2L, q.ackedTick());
+        assertTrue("stale own id still swallowed", q.onPong(a, 210));
+    }
+
+    // ------------------------------------------------------------------
     // Stats helpers
     // ------------------------------------------------------------------
 
