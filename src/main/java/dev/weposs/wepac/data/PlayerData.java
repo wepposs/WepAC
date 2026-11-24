@@ -194,6 +194,8 @@ public final class PlayerData {
     public final dev.weposs.wepac.packet.PacketPhysics.AirSim airSim =
             new dev.weposs.wepac.packet.PacketPhysics.AirSim();
     public int airStrafeBuffer = 0;
+    public double recentFriction = 0.6;
+    public long recentFrictionAt = 0L;
     public long lastAirStrafeAt = 0L;
     public long lastPacketFlyAt = 0L;
 

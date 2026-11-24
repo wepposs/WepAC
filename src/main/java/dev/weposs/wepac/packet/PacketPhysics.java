@@ -267,17 +267,45 @@ public final class PacketPhysics {
             prevSeq = -1L;
         }
 
-        /** @return how far the acceleration exceeded the vanilla bound (0 = legal / not judged) */
+        /** vanilla sprint-jump horizontal boost on the jump tick */
+        public static final double SPRINT_JUMP_BOOST = 0.2;
+
+        /** Air-only judgement (ground ticks are skipped). */
         public double onPacket(double x, double z, boolean clientGround, long seq, double tolerance) {
+            return onPacket(x, z, clientGround, seq, tolerance, Double.NaN, 0.0);
+        }
+
+        /**
+         * Full air + ground judgement.
+         *
+         * Vanilla per tick: {@code disp(t+1) = disp(t) * f(t) + a(t+1)} where
+         *  - f(t) = 0.91 in air, blockFriction * 0.91 on ground (onGround at the
+         *    START of tick t = the claim of the packet before it),
+         *  - a(t+1) = 0.026 in air, movementSpeed * 0.216 / blockFriction^3 on
+         *    ground (onGround at the start of t+1 = claim of the previous packet),
+         *  - the jump tick (ground -> air) may add the 0.2 sprint-jump boost.
+         *
+         * @param groundFriction the HIGHEST block friction the player could be
+         *                       standing on (lenient: more friction keeps more
+         *                       speed), NaN = do not judge ground ticks
+         * @param groundAccel    upper bound of the ground input acceleration
+         * @return how far the acceleration exceeded the vanilla bound (0 = legal / not judged)
+         */
+        public double onPacket(double x, double z, boolean clientGround, long seq, double tolerance,
+                               double groundFriction, double groundAccel) {
             boolean chain = prevSeq >= 0L && seq == prevSeq + 1L && !Double.isNaN(px);
             double nvx = chain ? x - px : Double.NaN;
             double nvz = chain ? z - pz : Double.NaN;
             double excess = 0.0;
-            if (chain && !Double.isNaN(vx) && air0 && air1) {
-                double rx = residual(nvx, AIR_FRICTION * vx);
-                double rz = residual(nvz, AIR_FRICTION * vz);
+            boolean groundModel = !Double.isNaN(groundFriction);
+            if (chain && !Double.isNaN(vx) && ((air0 && air1) || groundModel)) {
+                double f = air0 ? AIR_FRICTION : groundFriction * AIR_FRICTION;
+                double accel = air1 ? MAX_ACCEL : groundAccel;
+                if (!air1 && !clientGround) accel += SPRINT_JUMP_BOOST; // jump tick
+                double rx = residual(nvx, f * vx);
+                double rz = residual(nvz, f * vz);
                 double r = Math.sqrt(rx * rx + rz * rz);
-                excess = Math.max(0.0, r - MAX_ACCEL - tolerance);
+                excess = Math.max(0.0, r - accel - tolerance);
             }
             px = x;
             pz = z;
@@ -394,10 +422,24 @@ public final class PacketPhysics {
             return;
         }
         double tolerance = plugin.config().optDouble(CheckType.SPEED, "air-accel-tolerance", 0.01);
+        boolean groundSim = plugin.config().optBool(CheckType.SPEED, "ground-simulation", true);
+        double friction = Double.NaN;
+        if (groundSim) {
+            // ice momentum survives the step onto stone: keep the highest
+            // friction seen in the last 1.5s (the batch may span the edge)
+            double f = maxFrictionBelow(player);
+            if (f >= data.recentFriction || now - data.recentFrictionAt > 1500L) {
+                data.recentFriction = f;
+                data.recentFrictionAt = now;
+            }
+            friction = Math.max(f, data.recentFriction);
+        }
+        double groundAccel = groundSim ? groundAccelBound(player) : 0.0;
         double worst = 0.0;
         for (double[] mv : drained) {
             if (mv.length < 6) continue;
-            double over = air.onPacket(mv[1], mv[3], mv[4] > 0.5, (long) mv[5], tolerance);
+            double over = air.onPacket(mv[1], mv[3], mv[4] > 0.5, (long) mv[5], tolerance,
+                    friction, groundAccel);
             worst = Math.max(worst, over);
         }
         if (worst <= 0.0) return;
@@ -410,8 +452,58 @@ public final class PacketPhysics {
         if (data.airStrafeBuffer < plugin.config().optInt(CheckType.SPEED, "air-buffer", 3)) return;
         data.airStrafeBuffer = 0;
         speed.flag(player, data, String.format(Locale.ROOT,
-                "air simulation: horizontal acceleration %.3f above vanilla air control (0.026/tick)",
+                "movement simulation: horizontal acceleration %.3f above the vanilla friction/input bound",
                 worst), 2);
+    }
+
+    /** Vanilla block slipperiness (Block#getFriction); Bukkit exposes none. */
+    static double blockFriction(Material m) {
+        String n = m.name();
+        if (n.equals("BLUE_ICE")) return 0.989;
+        if (n.endsWith("ICE")) return 0.98; // ICE, PACKED_ICE, FROSTED_ICE
+        if (m == Material.SLIME_BLOCK) return 0.8;
+        return 0.6;
+    }
+
+    /**
+     * Highest friction among the blocks the player's footprint could rest on
+     * (vanilla reads y-0.5; we also look one block lower and at every corner,
+     * so an ice edge or a batch spanning a block border is never misjudged).
+     */
+    private static double maxFrictionBelow(Player player) {
+        org.bukkit.util.BoundingBox box = player.getBoundingBox();
+        org.bukkit.World w = player.getWorld();
+        double best = 0.6;
+        double[] ys = {box.getMinY() - 0.5, box.getMinY() - 1.0};
+        double[][] corners = {{box.getMinX(), box.getMinZ()}, {box.getMinX(), box.getMaxZ()},
+                {box.getMaxX(), box.getMinZ()}, {box.getMaxX(), box.getMaxZ()}};
+        for (double y : ys) {
+            for (double[] c : corners) {
+                Material m = w.getBlockAt((int) Math.floor(c[0]), (int) Math.floor(y),
+                        (int) Math.floor(c[1])).getType();
+                best = Math.max(best, blockFriction(m));
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Upper bound of ground input acceleration: movementSpeed * 0.216 / f^3 is
+     * largest on default-friction (0.6) blocks, where it equals movementSpeed.
+     * The attribute already carries Speed/Slowness, Soul Speed and plugin
+     * modifiers; the sprint factor is always granted because the client may
+     * toggle sprint inside the batch before the server attribute follows.
+     */
+    private static double groundAccelBound(Player player) {
+        double speed;
+        try {
+            speed = player.getAttribute(org.bukkit.attribute.Attribute.MOVEMENT_SPEED).getValue();
+            if (!player.isSprinting()) speed *= 1.3;
+        } catch (Throwable t) {
+            int lvl = Math.max(0, Compat.effectAmplifier(player, Compat.SPEED));
+            speed = 0.1 * 1.3 * (1.0 + 0.2 * lvl);
+        }
+        return speed * (0.21600002 / 0.216);
     }
 
     private void confirm(Player player, PlayerData data, Sim sim, double over) {

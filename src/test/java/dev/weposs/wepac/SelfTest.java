@@ -644,6 +644,45 @@ public class SelfTest {
         assertEquals(0.0, sim.onPacket(3.0, 0, false, seq++, 0.01), 1e-12);
     }
 
+    /** Vanilla ground walk/sprint/jump cycle with the full air+ground model. */
+    static double runGround(double speedAttr, double friction, double claimedAccel, boolean bhop) {
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        double groundAccel = 0.1 * 1.3 * (speedAttr / 0.1); // bound as computed in plugin
+        double x = 0, v = 0, worst = 0;
+        long seq = 1;
+        boolean onGround = true;
+        int airT = 0;
+        for (int i = 0; i < 60; i++) {
+            boolean startGround = onGround;
+            double f = startGround ? friction * 0.91 : 0.91;
+            double a = startGround ? claimedAccel : 0.026;
+            boolean jump = bhop && startGround && i > 5;
+            double dv = v + a + (jump ? 0.2 : 0.0);
+            x += dv;
+            v = dv * f;
+            if (jump) { onGround = false; airT = 0; }
+            else if (!onGround && ++airT >= 11) onGround = true;
+            worst = Math.max(worst, sim.onPacket(x, 0, onGround, seq++, 0.01, friction, groundAccel));
+        }
+        return worst;
+    }
+
+    @Test
+    public void groundSimVanillaNeverFlags() {
+        assertEquals("sprint", 0.0, runGround(0.13, 0.6, 0.13, false), 1e-12);
+        assertEquals("sprint-bhop", 0.0, runGround(0.13, 0.6, 0.13, true), 1e-12);
+        assertEquals("speed II bhop", 0.0, runGround(0.182, 0.6, 0.182, true), 1e-12);
+        assertEquals("ice bhop", 0.0, runGround(0.13, 0.98, 0.13 * 0.216 / Math.pow(0.98, 3), true), 1e-12);
+    }
+
+    @Test
+    public void groundSimSpeedHackFlags() {
+        // ground speed hack: 1.6x the legal input acceleration
+        assertTrue(runGround(0.13, 0.6, 0.13 * 1.6, false) > 0.0);
+        // bhop-speed: every hop 1.5x
+        assertTrue(runGround(0.13, 0.6, 0.2, true) > 0.0);
+    }
+
     // ------------------------------------------------------------------
     // TransactionManager.TxQueue
     // ------------------------------------------------------------------

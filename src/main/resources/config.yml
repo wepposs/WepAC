@@ -364,6 +364,10 @@ checks:
     # can never exceed 0.026 (vanilla air control, independent of Speed potions).
     # Catches air-strafe / air-speed far below the multiplier limit above.
     air-simulation: true
+    # Extends the same per-packet model to ground ticks: disp*blockFriction*0.91
+    # + movementSpeed attribute (ice/slime friction, Speed potions, Soul Speed
+    # and sprint-jump boost are modelled). Requires air-simulation.
+    ground-simulation: true
     air-accel-tolerance: 0.01
     air-buffer: 3
   jesus:
