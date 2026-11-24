@@ -684,6 +684,80 @@ public class SelfTest {
     }
 
     // ------------------------------------------------------------------
+    // Knockback hypothesis (transaction-synced anti-KB)
+    // ------------------------------------------------------------------
+
+    /**
+     * Airborne player moving +x; knockback (-0.45, 0.2) is offered as a
+     * candidate for 4 packets, the client applies {@code takeFraction} of it at
+     * packet {@code applyAt}. Returns {worstExcess, matchedAny}.
+     */
+    static double[] runKb(double takeFraction, int applyAt, PacketPhysics.AirSim.Blocker blocker) {
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        double[][] kb = {{-0.45, 0.2}};
+        double x = 0, z = 0, vx = 0.25, vz = 0, worst = 0;
+        boolean matched = false;
+        long seq = 1;
+        sim.onPacket(x, 70, z, false, seq++, 0.01, 0.6, 0.13, null, blocker);
+        for (int i = 0; i < 8; i++) {
+            if (i == applyAt) { vx = kb[0][0] * takeFraction; vz = kb[0][1] * takeFraction; }
+            double dvx = vx + 0.026, dvz = vz;   // input: forward (+x)
+            x += dvx; z += dvz;
+            vx = dvx * 0.91; vz = dvz * 0.91;
+            boolean offered = i >= 1 && i <= 4;
+            worst = Math.max(worst, sim.onPacket(x, 70, z, false, seq++, 0.01, 0.6, 0.13,
+                    offered ? kb : null, blocker));
+            if (offered && sim.lastKbMatched) matched = true;
+        }
+        return new double[]{worst, matched ? 1 : 0};
+    }
+
+    @Test
+    public void kbVanillaTakesKnockbackNeverFlags() {
+        PacketPhysics.AirSim.Blocker open = (x, y, z, dx, dz) -> false;
+        for (int at = 1; at <= 4; at++) {
+            double[] r = runKb(1.0, at, open);
+            assertEquals("kb applied at tick " + at + " flagged", 0.0, r[0], 1e-12);
+            assertEquals("kb at tick " + at + " must match", 1.0, r[1], 0);
+        }
+    }
+
+    @Test
+    public void kbIgnoredIsDetected() {
+        PacketPhysics.AirSim.Blocker open = (x, y, z, dx, dz) -> false;
+        assertEquals("100% anti-KB must not match", 0.0, runKb(0.0, 2, open)[1], 0);
+        assertEquals("80% reduction must not match", 0.0, runKb(0.2, 2, open)[1], 0);
+    }
+
+    @Test
+    public void kbIntoWallIsExcused() {
+        // a wall right behind the player stops the knockback on both axes
+        // pressed into a corner: vanilla collision zeroes both axes every tick
+        PacketPhysics.AirSim.Blocker wall = (x, y, z, dx, dz) -> true;
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        double[][] kb = {{-0.45, 0.2}};
+        long seq = 1;
+        boolean matched = false;
+        sim.onPacket(5, 70, 5, false, seq++, 0.01, 0.6, 0.13, null, wall);
+        for (int i = 0; i < 4; i++) {
+            sim.onPacket(5, 70, 5, false, seq++, 0.01, 0.6, 0.13, kb, wall);
+            matched |= sim.lastKbMatched;
+        }
+        assertTrue("knockback into a corner must be excused", matched);
+        // the same zero motion in the OPEN must not be excused (that is anti-KB)
+        PacketPhysics.AirSim.Blocker open = (x, y, z, dx, dz) -> false;
+        sim = new PacketPhysics.AirSim();
+        seq = 1;
+        matched = false;
+        sim.onPacket(5, 70, 5, false, seq++, 0.01, 0.6, 0.13, null, open);
+        for (int i = 0; i < 4; i++) {
+            sim.onPacket(5, 70, 5, false, seq++, 0.01, 0.6, 0.13, kb, open);
+            matched |= sim.lastKbMatched;
+        }
+        assertFalse("standing still in the open under knockback = anti-KB", matched);
+    }
+
+    // ------------------------------------------------------------------
     // TimerBalance
     // ------------------------------------------------------------------
 

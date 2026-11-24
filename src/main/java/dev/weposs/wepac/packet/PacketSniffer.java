@@ -242,7 +242,7 @@ public final class PacketSniffer {
         // feed the per-packet physics simulation (bounded queue; when the main
         // thread stalls the offer silently drops - Sim resyncs on time gaps)
         data.packetMoves.offer(new double[]{now, x, y, z,
-                Boolean.TRUE.equals(ground) ? 1.0 : 0.0, seq});
+                Boolean.TRUE.equals(ground) ? 1.0 : 0.0, seq, data.tx.ackedTick()});
         double px = data.lastPacketX, py = data.lastPacketY, pz = data.lastPacketZ;
         data.lastPacketX = x;
         data.lastPacketY = y;

@@ -96,7 +96,19 @@ public final class ConnectionListener implements Listener {
     public void onVelocity(PlayerVelocityEvent event) {
         // 800ms covers melee knockback settling (~0.5-0.7s) without blinding
         // the combat checks for longer than the physics requires
-        plugin.data().get(event.getPlayer()).exemptVelocity(800L);
+        PlayerData data = plugin.data().get(event.getPlayer());
+        dev.weposs.wepac.packet.TransactionManager tm = plugin.transactions();
+        if (tm == null || !tm.active()) {
+            data.exemptVelocity(800L);
+            return;
+        }
+        // transaction-modelled: the velocity packet goes out at the end of this
+        // tick, the next ping (tick()+1) is ordered after it. The horizontal
+        // simulation tests "kb applied in this tick" as a second hypothesis.
+        data.exemptVelocityModelled(800L);
+        org.bukkit.util.Vector v = event.getVelocity();
+        data.pendingKbs.addLast(new double[]{tm.tick() + 1, v.getX(), v.getZ()});
+        while (data.pendingKbs.size() > 8) data.pendingKbs.pollFirst();
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -123,7 +135,20 @@ public final class ConnectionListener implements Listener {
                 || cause == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION
                 || cause == EntityDamageEvent.DamageCause.SONIC_BOOM
                 || cause == EntityDamageEvent.DamageCause.PROJECTILE;
-        data.exemptVelocity(bigLaunch ? 1200L : 700L);
+        // Melee/projectile knockback reaches the client as an entity-motion
+        // packet (PlayerVelocityEvent) and is modelled by the transaction-synced
+        // simulation. Explosion knockback travels INSIDE the explode packet and
+        // the warden's sonic boom is a push: neither is modelled - full exemption.
+        dev.weposs.wepac.packet.TransactionManager tm = plugin.transactions();
+        boolean modelled = tm != null && tm.active()
+                && cause != EntityDamageEvent.DamageCause.BLOCK_EXPLOSION
+                && cause != EntityDamageEvent.DamageCause.ENTITY_EXPLOSION
+                && cause != EntityDamageEvent.DamageCause.SONIC_BOOM;
+        if (modelled) {
+            data.exemptVelocityModelled(bigLaunch ? 1200L : 700L);
+        } else {
+            data.exemptVelocity(bigLaunch ? 1200L : 700L);
+        }
 
         // capture the server-applied knockback next tick for the anti-KB check:
         // "Velocity" modules (CatLean's flagship) absorb 85-90% of it
@@ -145,7 +170,6 @@ public final class ConnectionListener implements Listener {
                 d.kbActual = 0;
                 // the knockback velocity packet went out at the end of the
                 // damage tick; the NEXT ping we send is ordered after it
-                dev.weposs.wepac.packet.TransactionManager tm = plugin.transactions();
                 d.pendingKbTick = tm != null && tm.active() ? tm.tick() + 1 : -1L;
             }
         });

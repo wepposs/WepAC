@@ -195,6 +195,15 @@ public final class PlayerData {
             new dev.weposs.wepac.packet.PacketPhysics.AirSim();
     public int airStrafeBuffer = 0;
     public long airSimExemptAt = 0L;
+    /** knockbacks sent to the client and not yet acknowledged: {tick, vx, vz} (main thread only) */
+    public final java.util.ArrayDeque<double[]> pendingKbs = new java.util.ArrayDeque<>();
+    public boolean kbWindowMatched = false;
+    public boolean kbWindowJudged = false;
+    public boolean kbWindowBlind = false;
+    public int simKbBuffer = 0;
+    public long lastSimKbAt = 0L;
+    /** velocity exemption from sources the simulation does NOT model (main thread) */
+    public long unmodelledVelocityUntil = 0L;
     // ---- balance timer (netty thread writes, main thread reads/resets) ----
     public final dev.weposs.wepac.packet.TimerBalance timerBalance =
             new dev.weposs.wepac.packet.TimerBalance();
@@ -301,6 +310,20 @@ public final class PlayerData {
 
     public void exemptVelocity(long ms) {
         velocityExemptUntil = Math.max(velocityExemptUntil, System.currentTimeMillis() + ms);
+        unmodelledVelocityUntil = Math.max(unmodelledVelocityUntil, System.currentTimeMillis() + ms);
+    }
+
+    /**
+     * Exemption for velocity the horizontal simulation models exactly via
+     * transactions (PlayerVelocityEvent): the vertical/heuristic layers still
+     * stand down, the horizontal simulation keeps judging.
+     */
+    public void exemptVelocityModelled(long ms) {
+        velocityExemptUntil = Math.max(velocityExemptUntil, System.currentTimeMillis() + ms);
+    }
+
+    public boolean unmodelledVelocityExempt() {
+        return System.currentTimeMillis() < unmodelledVelocityUntil;
     }
 
     public int vl(CheckType type) {

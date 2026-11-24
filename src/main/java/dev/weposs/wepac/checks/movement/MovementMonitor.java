@@ -204,6 +204,9 @@ public final class MovementMonitor implements Listener {
         Check kb = plugin.check(CheckType.VELOCITY);
         if (kb == null || !plugin.config().isEnabled(CheckType.VELOCITY)) return;
         if (data.pendingKbTime == 0L) return;
+        // NOTE: stays active next to the transaction-synced model in
+        // PacketPhysics: a client that ignores knockback while standing still
+        // sends no position packets, which the per-packet model cannot judge.
 
         long now = System.currentTimeMillis();
         if (data.pendingKbTick >= 0L) {
