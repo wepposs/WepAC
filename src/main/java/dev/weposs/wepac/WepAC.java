@@ -52,6 +52,7 @@ public final class WepAC extends JavaPlugin {
     private ViolationStore violationStore;
     private AIBrain aiBrain;
     private dev.weposs.wepac.packet.PacketSniffer packetSniffer;
+    private dev.weposs.wepac.packet.TransactionManager transactions;
     private final List<Check> checks = new ArrayList<>();
 
     @Override
@@ -135,6 +136,7 @@ public final class WepAC extends JavaPlugin {
                 packetSniffer.start();
                 // per-packet gravity simulation, fed by the sniffer's move queue
                 new dev.weposs.wepac.packet.PacketPhysics(this);
+                transactions = new dev.weposs.wepac.packet.TransactionManager(this, packetSniffer);
             } catch (Throwable t) {
                 packetSniffer = null;
                 getLogger().severe("Packet sniffer failed to start (packet checks disabled): " + t);
@@ -228,11 +230,14 @@ public final class WepAC extends JavaPlugin {
         // incl. entity support runs once per tick, not separately at 4Hz and 20Hz)
         Bukkit.getScheduler().runTaskTimer(this, () -> {
             long now = System.currentTimeMillis();
+            // snapshot is tagged with the tick whose ping goes out right after
+            // it, so pong(N) == "client has seen snapshot N"
+            long snapTick = transactions == null ? -1L : transactions.tick() + 1;
             for (Player p : Bukkit.getOnlinePlayers()) {
                 if (p.hasPermission("wepac.bypass")) continue; // never checked - don't track
                 PlayerData d = dataManager.get(p);
                 org.bukkit.Location loc = p.getLocation();
-                d.posHistory.addLast(new double[]{now, loc.getX(), loc.getY(), loc.getZ()});
+                d.posHistory.addLast(new double[]{now, loc.getX(), loc.getY(), loc.getZ(), snapTick});
                 while (!d.posHistory.isEmpty()
                         && now - d.posHistory.peekFirst()[0] > 2000L) {
                     d.posHistory.pollFirst();
@@ -243,6 +248,7 @@ public final class WepAC extends JavaPlugin {
                 d.serverOnGround = grounded;
                 if (grounded) d.lastGroundedMs = now;
             }
+            if (transactions != null) transactions.onTick();
         }, 1L, 1L);
 
         // batched persistence flush (records + VL): YAML snapshot on the main
@@ -351,6 +357,11 @@ public final class WepAC extends JavaPlugin {
 
     public ViolationStore vlStore() {
         return violationStore;
+    }
+
+    /** null when the packet layer is unavailable */
+    public dev.weposs.wepac.packet.TransactionManager transactions() {
+        return transactions;
     }
 
     public dev.weposs.wepac.packet.PacketSniffer packets() {

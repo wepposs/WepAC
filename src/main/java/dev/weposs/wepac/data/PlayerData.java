@@ -178,6 +178,23 @@ public final class PlayerData {
     public final dev.weposs.wepac.packet.PacketPhysics.Sim physicsSim =
             new dev.weposs.wepac.packet.PacketPhysics.Sim();
     public int packetFlyBuffer = 0;
+
+    // ---- transactions (ping/pong tick sync) ----
+    public final dev.weposs.wepac.packet.TransactionManager.TxQueue tx =
+            new dev.weposs.wepac.packet.TransactionManager.TxQueue();
+    /** acked tick snapshotted on the netty thread when the attack packet arrived */
+    public volatile long ackTickAtAttack = -1L;
+    /** server tick at the moment the attack packet arrived */
+    public volatile long tickAtAttack = -1L;
+    /** server tick in which the last knockback was applied (-1 = none) */
+    public long pendingKbTick = -1L;
+    /** monotonically increasing counter of ALL flying packets (pos or not) */
+    public volatile long flyingSeq = 0L;
+    // ---- horizontal air simulation ----
+    public final dev.weposs.wepac.packet.PacketPhysics.AirSim airSim =
+            new dev.weposs.wepac.packet.PacketPhysics.AirSim();
+    public int airStrafeBuffer = 0;
+    public long lastAirStrafeAt = 0L;
     public long lastPacketFlyAt = 0L;
 
     // ---- yaw gcd ----

@@ -206,6 +206,27 @@ public final class MovementMonitor implements Listener {
         if (data.pendingKbTime == 0L) return;
 
         long now = System.currentTimeMillis();
+        if (data.pendingKbTick >= 0L) {
+            if (data.tx.ackedTick() < data.pendingKbTick) {
+                // transaction sync: the client has not even RECEIVED the
+                // knockback yet - movement now is not a reaction to it. Slide
+                // the window start forward (bounded: a withholding client is
+                // handled by the BadPackets transaction-timeout instead).
+                if (now - data.pendingKbTime < 3000L) {
+                    data.pendingKbTime = now;
+                    data.kbActual = 0;
+                    return;
+                }
+                data.pendingKbTime = 0L; // never acked: drop the sample
+                data.pendingKbTick = -1L;
+                return;
+            }
+            // acked somewhere inside this 250ms sample: the window started at
+            // the latest at the previous sample - count this sample's motion
+            data.pendingKbTick = -1L;
+            data.pendingKbTime = now - 250L;
+            data.kbActual = 0;
+        }
         if (now - data.pendingKbTime <= 700L) {
             // A16: accumulate the PROJECTION of movement onto the knockback
             // direction, not the total distance - a sprint-retreat no longer

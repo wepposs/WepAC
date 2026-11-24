@@ -81,7 +81,9 @@ public final class PacketSniffer {
                         @Override
                         public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
                             try {
-                                onPacket(uuid, msg);
+                                if (onPacket(uuid, msg)) {
+                                    return; // our own transaction pong: swallow
+                                }
                             } catch (Throwable ignored) {
                                 // never break the connection
                             }
@@ -139,19 +141,43 @@ public final class PacketSniffer {
         return byName && (hasPos == null || hasPos);
     }
 
-    private void onPacket(UUID uuid, Object msg) {
+    /** The injected channel of an online player, or null. */
+    public Channel channel(UUID uuid) {
+        return channels.get(uuid);
+    }
+
+    /** @return true when the packet must be swallowed (our own pong) */
+    private boolean onPacket(UUID uuid, Object msg) {
         // IMPORTANT: movement packets are NESTED classes
         // (ServerboundMovePlayerPacket$Pos/$Rot/$PosRot/$Status on Mojang mappings,
         // PacketPlayInFlying$PacketPlayInPosition/... on Spigot mappings).
         // Class#getSimpleName() of a nested class drops the outer name ("Pos",
         // "PacketPlayInPosition"), so we MUST match on the full binary name.
         String cls = msg.getClass().getName();
+        if (cls.contains("Pong")) {
+            PlayerData pd = plugin.data().getIfLoaded(uuid);
+            if (pd == null) return false;
+            Integer id = readIntField(msg, "id");
+            return id != null && pd.tx.onPong(id, System.currentTimeMillis());
+        }
+        if (cls.contains("ServerboundInteractPacket") || cls.contains("PacketPlayInUseEntity")) {
+            PlayerData pd = plugin.data().getIfLoaded(uuid);
+            if (pd != null) {
+                // snapshot what the client had CONFIRMED seeing when it attacked;
+                // pongs arriving later must not shift the lag-compensation window
+                pd.ackTickAtAttack = pd.tx.ackedTick();
+                TransactionManager tm = plugin.transactions();
+                pd.tickAtAttack = tm == null ? -1L : tm.tick();
+            }
+            return false;
+        }
         boolean flying = cls.contains("PacketPlayInFlying")
                 || cls.contains("ServerboundMovePlayerPacket");
-        if (!flying) return;
+        if (!flying) return false;
 
         PlayerData data = plugin.data().getIfLoaded(uuid);
-        if (data == null) return;
+        if (data == null) return false;
+        long seq = ++data.flyingSeq;
 
         long prevFlying = data.lastFlyingPacket;
         data.packetCounter.increment();
@@ -203,17 +229,17 @@ public final class PacketSniffer {
                             : " - SOME PACKET CHECKS INACTIVE on this build"));
         }
         if (!positionBearing(cls, hasPos) || x == null || y == null || z == null) {
-            return; // Rot/StatusOnly: parent-field zeros must never be consumed
+            return false; // Rot/StatusOnly: parent-field zeros must never be consumed
         }
         if (!Double.isFinite(x) || !Double.isFinite(y) || !Double.isFinite(z)) {
             // NaN/Inf coordinates: impossible in vanilla, crash other plugins
             data.lastBadPosition = now;
-            return;
+            return false;
         }
         // feed the per-packet physics simulation (bounded queue; when the main
         // thread stalls the offer silently drops - Sim resyncs on time gaps)
         data.packetMoves.offer(new double[]{now, x, y, z,
-                Boolean.TRUE.equals(ground) ? 1.0 : 0.0});
+                Boolean.TRUE.equals(ground) ? 1.0 : 0.0, seq});
         double px = data.lastPacketX, py = data.lastPacketY, pz = data.lastPacketZ;
         data.lastPacketX = x;
         data.lastPacketY = y;
@@ -240,6 +266,17 @@ public final class PacketSniffer {
                     data.lastBlinkResumeDist = dist;
                 }
             }
+        }
+        return false;
+    }
+
+    private static Integer readIntField(Object packet, String... names) {
+        Field f = resolveField(packet.getClass(), Integer.TYPE, names);
+        if (f == null) return null;
+        try {
+            return f.getInt(packet);
+        } catch (IllegalAccessException e) {
+            return null;
         }
     }
 

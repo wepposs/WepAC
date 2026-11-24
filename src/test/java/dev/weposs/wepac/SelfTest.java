@@ -585,6 +585,100 @@ public class SelfTest {
     }
 
     // ------------------------------------------------------------------
+    // PacketPhysics.AirSim (horizontal air control bound)
+    // ------------------------------------------------------------------
+
+    /** Simulates vanilla air ticks with a given input angle per tick; returns worst excess. */
+    static double runAir(PacketPhysics.AirSim sim, double startV, double accel,
+                         java.util.function.IntToDoubleFunction yawAt, int ticks) {
+        double x = 0, z = 0, vx = startV, vz = 0, worst = 0;
+        long seq = 1;
+        sim.onPacket(x, z, true, seq++, 0.01);          // ground before jump
+        x += vx; z += vz;
+        sim.onPacket(x, z, false, seq++, 0.01);         // jump tick (excluded)
+        for (int i = 0; i < ticks; i++) {
+            vx *= 0.91; vz *= 0.91;
+            double a = yawAt.applyAsDouble(i);
+            vx += Math.cos(a) * accel; vz += Math.sin(a) * accel;
+            x += vx; z += vz;
+            worst = Math.max(worst, sim.onPacket(x, z, false, seq++, 0.01));
+        }
+        return worst;
+    }
+
+    @Test
+    public void airSimVanillaStrafeNeverFlags() {
+        // sprint-jump at full speed, then hard 90deg/180deg input changes mid-air
+        assertEquals(0.0, runAir(new PacketPhysics.AirSim(), 0.6, 0.026, i -> i * 1.7, 12), 1e-12);
+        assertEquals(0.0, runAir(new PacketPhysics.AirSim(), 0.3, 0.026, i -> Math.PI, 12), 1e-12);
+        assertEquals(0.0, runAir(new PacketPhysics.AirSim(), 0.0, 0.02, i -> 0.3, 12), 1e-12);
+    }
+
+    @Test
+    public void airSimSpeedAndStrafeHacksFlag() {
+        // air-speed: 0.06/tick acceleration
+        assertTrue(runAir(new PacketPhysics.AirSim(), 0.3, 0.06, i -> 0.0, 10) > 0.0);
+        // instant air-strafe: velocity re-pointed to the input direction every tick
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        double x = 0, z = 0, worst = 0;
+        long seq = 1;
+        sim.onPacket(x, z, false, seq++, 0.01);
+        for (int i = 0; i < 10; i++) {
+            double a = i * Math.PI / 2;  // 90 degree turns, speed kept at 0.28
+            x += Math.cos(a) * 0.28; z += Math.sin(a) * 0.28;
+            worst = Math.max(worst, sim.onPacket(x, z, false, seq++, 0.01));
+        }
+        assertTrue("strafe must flag", worst > 0.2);
+    }
+
+    @Test
+    public void airSimWallCollisionAndGapsNoFlag() {
+        PacketPhysics.AirSim sim = new PacketPhysics.AirSim();
+        long seq = 1;
+        sim.onPacket(0, 0, false, seq++, 0.01);
+        sim.onPacket(0.5, 0, false, seq++, 0.01);
+        // wall: x stops dead
+        assertEquals(0.0, sim.onPacket(0.5, 0, false, seq++, 0.01), 1e-12);
+        // a non-position packet in between breaks the chain: no judgement
+        seq += 1;
+        assertEquals(0.0, sim.onPacket(3.0, 0, false, seq++, 0.01), 1e-12);
+    }
+
+    // ------------------------------------------------------------------
+    // TransactionManager.TxQueue
+    // ------------------------------------------------------------------
+
+    @Test
+    public void txQueueInOrderAcks() {
+        dev.weposs.wepac.packet.TransactionManager.TxQueue q =
+                new dev.weposs.wepac.packet.TransactionManager.TxQueue();
+        int a = q.send(10, 0), b = q.send(11, 50);
+        assertTrue("ids must be negative", a < 0 && b < 0 && a != b);
+        assertEquals(-1L, q.ackedTick());
+        assertTrue(q.onPong(a, 80));
+        assertEquals(10L, q.ackedTick());
+        assertEquals(80L, q.rttMs());
+        assertTrue(q.onPong(b, 130));
+        assertEquals(11L, q.ackedTick());
+        assertEquals(0L, q.consumeOutOfOrder());
+        assertFalse("positive ids are not ours", q.onPong(5, 140));
+    }
+
+    @Test
+    public void txQueueOutOfOrderAndWithholding() {
+        dev.weposs.wepac.packet.TransactionManager.TxQueue q =
+                new dev.weposs.wepac.packet.TransactionManager.TxQueue();
+        int a = q.send(1, 0);
+        int b = q.send(2, 50);
+        q.send(3, 100);
+        assertEquals(20000L, q.oldestPendingAge(20000));
+        assertTrue(q.onPong(b, 200));       // skipped a
+        assertEquals(1L, q.consumeOutOfOrder());
+        assertEquals(2L, q.ackedTick());
+        assertTrue("stale own id still swallowed", q.onPong(a, 210));
+    }
+
+    // ------------------------------------------------------------------
     // Stats helpers
     // ------------------------------------------------------------------
 

@@ -360,6 +360,12 @@ checks:
     # Max allowed = vanilla_limit * multiplier (vanilla sprint-jump ~0.29 b/tick)
     multiplier: 1.45
     buffer: 8
+    # Per-packet horizontal AIR simulation: in air |disp(t+1) - 0.91*disp(t)|
+    # can never exceed 0.026 (vanilla air control, independent of Speed potions).
+    # Catches air-strafe / air-speed far below the multiplier limit above.
+    air-simulation: true
+    air-accel-tolerance: 0.01
+    air-buffer: 3
   jesus:
     enabled: true
     threshold: 15
@@ -590,6 +596,9 @@ checks:
   badpackets:
     enabled: true
     threshold: 5
+    # Transaction layer (ping/pong tick sync): a client that keeps sending
+    # movement but holds back our pongs this long is spoofing its ping.
+    transaction-timeout-ms: 15000
   packetfly:
     enabled: true
     threshold: 16

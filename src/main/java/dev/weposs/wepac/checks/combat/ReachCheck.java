@@ -29,6 +29,11 @@ import java.util.Locale;
  */
 public final class ReachCheck extends Check {
 
+    /** vanilla client interpolates remote players over 3 position updates */
+    private static final long INTERP_TICKS = 3L;
+    /** hard cap: withholding pongs must never stretch the window past 1s */
+    private static final long MAX_BACKTRACK_TICKS = 20L;
+
     public ReachCheck(WepAC plugin) {
         super(plugin, CheckType.REACH);
     }
@@ -60,11 +65,30 @@ public final class ReachCheck extends Check {
         long windowStart = System.currentTimeMillis()
                 - Math.min(600L, attacker.getPing() + vPing / 2L + 150L);
         PlayerData victimData = plugin.data().getIfLoaded(victim.getUniqueId());
+        // Transaction-exact window: the client had CONFIRMED snapshot ackTick when
+        // it sent the attack and could at most know snapshots up to tickAtAttack.
+        // Entities render interpolated over the last 3 snapshots. getPing() is
+        // not involved at all, so keep-alive ping spoofing buys nothing.
+        dev.weposs.wepac.packet.TransactionManager tm = plugin.transactions();
+        long ack = data.ackTickAtAttack;
+        long upper = data.tickAtAttack;
+        // only player victims have a tick-tagged history; mobs keep the heuristic
+        boolean exact = tm != null && tm.active() && ack >= 0L && upper >= ack
+                && victimData != null;
+        long lowerTick = exact ? Math.max(ack - INTERP_TICKS, upper - MAX_BACKTRACK_TICKS) : 0L;
+        if (exact) {
+            // the ping allowance above becomes redundant: only movement slack remains
+            allowed = maxReach + (attacker.getVelocity().length() > 0.1 ? 0.35 : 0.0) + 0.03;
+        }
         if (victimData != null) {
             double w = victim.getWidth();
             double h = victim.getHeight();
             for (double[] pos : victimData.posHistory) {
-                if (pos[0] < windowStart) continue;
+                if (exact && pos.length > 4) {
+                    if (pos[4] < lowerTick || pos[4] > upper + 1) continue;
+                } else if (pos[0] < windowStart) {
+                    continue;
+                }
                 BoundingBox box = BoundingBox.of(
                         new Vector(pos[1], pos[2] + h / 2.0, pos[3]), w, h, w);
                 minDistance = Math.min(minDistance, rayOrBox(eyeVec, dir, box));
@@ -75,7 +99,8 @@ public final class ReachCheck extends Check {
 
         if (minDistance > allowed) {
             flag(attacker, data, String.format(Locale.ROOT,
-                    "%.2f > %.2f blocks (lag-compensated)", minDistance, allowed), 2);
+                    "%.2f > %.2f blocks (%s)", minDistance, allowed,
+                    exact ? "transaction-synced" : "lag-compensated"), 2);
         }
     }
 

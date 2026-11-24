@@ -231,6 +231,73 @@ public final class PacketPhysics {
         }
     }
 
+    /**
+     * Horizontal air simulation (B1.1, pure, unit-tested).
+     *
+     * Vanilla airborne horizontal motion per tick is
+     * {@code disp(t+1) = disp(t) * 0.91 + accel}, where the input acceleration
+     * is the player's flying speed: 0.02, or 0.026 while sprinting - it is NOT
+     * affected by Speed potions, attributes or the yaw it is applied in. So in
+     * air the deviation {@code |disp(t+1) - 0.91 * disp(t)|} can never exceed
+     * 0.026, whatever the player presses. Air-strafe, air-speed, "bhop speed"
+     * and instant direction changes all break this bound by an order of
+     * magnitude, while the limit is independent of any tuned constant.
+     *
+     * Validity conditions (otherwise the pair is skipped, never charged):
+     *  - three CONSECUTIVE flying packets (seq numbers adjacent), so each
+     *    displacement is exactly one client tick;
+     *  - the two earlier packets both claimed airborne: then the friction of the
+     *    middle tick was pure air (0.91) and its acceleration was air control.
+     *    The jump tick itself (ground friction + sprint-jump boost) is excluded;
+     *  - an axis that moved LESS than predicted in the same direction is never
+     *    charged: wall collisions, attack slowdown and braking only remove speed.
+     */
+    public static final class AirSim {
+        public static final double AIR_FRICTION = 0.91;
+        public static final double MAX_ACCEL = 0.026;
+
+        private double px = Double.NaN, pz = Double.NaN;
+        private double vx = Double.NaN, vz = Double.NaN;
+        private boolean air1 = false, air0 = false;
+        private long prevSeq = -1L;
+
+        public void reset() {
+            px = pz = vx = vz = Double.NaN;
+            air1 = air0 = false;
+            prevSeq = -1L;
+        }
+
+        /** @return how far the acceleration exceeded the vanilla bound (0 = legal / not judged) */
+        public double onPacket(double x, double z, boolean clientGround, long seq, double tolerance) {
+            boolean chain = prevSeq >= 0L && seq == prevSeq + 1L && !Double.isNaN(px);
+            double nvx = chain ? x - px : Double.NaN;
+            double nvz = chain ? z - pz : Double.NaN;
+            double excess = 0.0;
+            if (chain && !Double.isNaN(vx) && air0 && air1) {
+                double rx = residual(nvx, AIR_FRICTION * vx);
+                double rz = residual(nvz, AIR_FRICTION * vz);
+                double r = Math.sqrt(rx * rx + rz * rz);
+                excess = Math.max(0.0, r - MAX_ACCEL - tolerance);
+            }
+            px = x;
+            pz = z;
+            vx = nvx;
+            vz = nvz;
+            air0 = air1;
+            air1 = !clientGround;
+            prevSeq = seq;
+            return excess;
+        }
+
+        /** Per-axis deviation; a same-direction slowdown is explained by collision. */
+        static double residual(double actual, double expected) {
+            if (Math.abs(actual) <= Math.abs(expected) && actual * expected >= 0.0) {
+                return 0.0;
+            }
+            return actual - expected;
+        }
+    }
+
     // ------------------------------------------------------------------
     // Main-thread evaluation
     // ------------------------------------------------------------------
@@ -254,11 +321,7 @@ public final class PacketPhysics {
         if (player.hasPermission("wepac.bypass")) {
             data.packetMoves.clear();
             sim.reset();
-            return;
-        }
-        Check check = plugin.check(CheckType.PACKETFLY);
-        if (check == null || !check.enabled()) {
-            data.packetMoves.clear();
+            data.airSim.reset();
             return;
         }
 
@@ -274,6 +337,13 @@ public final class PacketPhysics {
                 || now - data.lastTeleport < 1500L
                 || now - data.lastRespawn < 3000L
                 || now - data.joinTime < 3000L;
+
+        processAir(player, data, drained, exempt, now);
+
+        Check check = plugin.check(CheckType.PACKETFLY);
+        if (check == null || !check.enabled()) {
+            return;
+        }
         if (exempt) {
             sim.resync(drained.get(drained.size() - 1)[2], now);
             return;
@@ -305,6 +375,43 @@ public final class PacketPhysics {
         if (serverGrounded && data.packetFlyBuffer > 0) {
             data.packetFlyBuffer = 0; // standing on ground: pending overflows were noise
         }
+    }
+
+    /** Horizontal air simulation over this tick's packet batch (flags SPEED). */
+    private void processAir(Player player, PlayerData data, List<double[]> drained,
+                            boolean exempt, long now) {
+        AirSim air = data.airSim;
+        Check speed = plugin.check(CheckType.SPEED);
+        if (speed == null || !speed.enabled()
+                || !plugin.config().optBool(CheckType.SPEED, "air-simulation", true)) {
+            return;
+        }
+        // contexts whose horizontal physics is not plain air: resync, never charge
+        if (exempt || data.bedrock() || GroundUtil.inLiquid(player)
+                || GroundUtil.onClimbable(player) || bounceContext(player)
+                || Compat.effectAmplifier(player, Compat.LEVITATION) >= 0) {
+            air.reset();
+            return;
+        }
+        double tolerance = plugin.config().optDouble(CheckType.SPEED, "air-accel-tolerance", 0.01);
+        double worst = 0.0;
+        for (double[] mv : drained) {
+            if (mv.length < 6) continue;
+            double over = air.onPacket(mv[1], mv[3], mv[4] > 0.5, (long) mv[5], tolerance);
+            worst = Math.max(worst, over);
+        }
+        if (worst <= 0.0) return;
+        // entity pushing (crowds, mobs) adds real horizontal velocity: the
+        // scan is only paid for when the bound was actually broken
+        if (!player.getNearbyEntities(1.2, 1.5, 1.2).isEmpty()) return;
+        if (now - data.lastAirStrafeAt > 2000L) data.airStrafeBuffer = 0;
+        data.lastAirStrafeAt = now;
+        data.airStrafeBuffer++;
+        if (data.airStrafeBuffer < plugin.config().optInt(CheckType.SPEED, "air-buffer", 3)) return;
+        data.airStrafeBuffer = 0;
+        speed.flag(player, data, String.format(Locale.ROOT,
+                "air simulation: horizontal acceleration %.3f above vanilla air control (0.026/tick)",
+                worst), 2);
     }
 
     private void confirm(Player player, PlayerData data, Sim sim, double over) {

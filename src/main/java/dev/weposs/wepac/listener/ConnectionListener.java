@@ -143,6 +143,10 @@ public final class ConnectionListener implements Listener {
                 d.pendingKbStartZ = at.getZ();
                 d.pendingKbTime = System.currentTimeMillis();
                 d.kbActual = 0;
+                // the knockback velocity packet went out at the end of the
+                // damage tick; the NEXT ping we send is ordered after it
+                dev.weposs.wepac.packet.TransactionManager tm = plugin.transactions();
+                d.pendingKbTick = tm != null && tm.active() ? tm.tick() + 1 : -1L;
             }
         });
     }
